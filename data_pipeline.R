@@ -3,9 +3,7 @@ library("cansim")
 library("tidyr")
 library("dplyr")
 
-#finds the folder this script lives in, whether run via Rscript,
-#source(), or RStudio's Source button -- so saved output always lands
-#next to the script regardless of the current working directory
+#define function that returns folder location of current script 
 script_dir <- function() {
   cmd_args <- commandArgs(trailingOnly = FALSE)
   file_arg <- grep("^--file=", cmd_args, value = TRUE)
@@ -16,49 +14,52 @@ script_dir <- function() {
   if (length(frame_files) > 0) {
     return(dirname(normalizePath(frame_files[[length(frame_files)]])))
   }
+
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    doc_path <- tryCatch(rstudioapi::getSourceEditorContext()$path, error = function(e) "")
+    if (nzchar(doc_path)) {
+      return(dirname(normalizePath(doc_path)))
+    }
+  }
   stop("Could not determine script location. Run this with Rscript or source(), or setwd() to this script's folder first.")
 }
 
-#get labour productivity data for aggregate business sector
-aggregate_business_lp <- get_cansim("36-10-0206-01")
+#retrieve data from statscan table 0480 
+lp_data <- get_cansim("36-10-0480-01")
 
-#filter data to include only rows with labour productivity and after 1996
-aggregate_business_lp <- aggregate_business_lp %>%
-  filter(`Labour productivity measures and related measures` == "Labour productivity" &
-           substr(aggregate_business_lp$REF_DATE, 1, 4) >= 1997)
+# Hierarchy for Industry is a dot-path of ancestor IDs (e.g. "1.323.2.3.4"), so its
+# number of segments is the depth (1 = whole-economy total, 5 = 2-digit, 6 = 3-digit)
+# Depth 3 holds 11 aggregates, but only "Business sector industries" and "Non-business sector industries"
+# are parents of other 2-digit and 3-digit sectors so drop all other aggregates 
+# Also drop any sectors more than 3-digits
+industry_depth <- lengths(strsplit(as.character(lp_data$`Hierarchy for Industry`), "[.]"))
+keep_industry <- industry_depth == 1 |
+  lp_data$Industry %in% c("Business sector industries", "Non-business sector industries") |
+  industry_depth %in% c(5, 6)
 
-#annualize quarterly data by averaging every quarter of the year
-aggregate_business_lp <- aggregate_business_lp %>%
-  mutate(Year = substr(aggregate_business_lp$REF_DATE, 1, 4)) %>%
-  group_by(Year) %>%
-  summarize(Value = mean(VALUE, na.rm = TRUE))
+# Drop rows with "Northwest Territories including Nunavut"
+keep_geo <- lp_data$GEO != "Northwest Territories including Nunavut"
 
-#add industry classification row 
-aggregate_business_lp <- aggregate_business_lp %>%
-  mutate(`North American Industry Classification System (NAICS)` = "Aggregate Business Sector")
+# Row-subset lp_data (and industry_depth, kept in lockstep) using the
+# logical vectors above, to keep only desired industries/depths + geographies
+lp_data <- lp_data[keep_industry & keep_geo, ]
+industry_depth <- industry_depth[keep_industry & keep_geo]
 
-
-#get labour productivity industry for each NAICS industry
-industry_lp <- get_cansim("36-10-0207-01")
-
-#filter data to include only rows with labour productivity 
-industry_lp <- industry_lp %>%
-  filter(`Labour productivity measures and related variables` == "Labour productivity")
-
-#drop non-business activity, total economic activity rows
-industry_lp <- industry_lp %>%
-  filter(`North American Industry Classification System (NAICS)` != "Total economy" &
-           `North American Industry Classification System (NAICS)` != "Non-business sector" &
-           substr(industry_lp$REF_DATE, 1, 4) >= 1997)
-
-#annualize quarterly data by averaging every quarter of the year
-industry_lp <- industry_lp %>%
-  mutate(Year = substr(industry_lp$Date, 1, 4)) %>%
-  group_by(`North American Industry Classification System (NAICS)`, Year) %>%
-  summarize(Value = mean(VALUE, na.rm = TRUE), .groups = "drop")
-
-#join aggregate business sector df with industry specific df 
-lp_data <- bind_rows(aggregate_business_lp, industry_lp)
+# Shape data frame to be more readable for app.R
+lp_data <- lp_data %>%
+  rename(Geography = GEO, Variable = `Labour productivity and related measures`) %>%
+  mutate(
+    Year = as.integer(REF_DATE),
+    Value = as.numeric(VALUE),
+    Geography = as.character(Geography),
+    Variable = as.character(Variable),
+    Industry = as.character(Industry),
+    IndustryLevel = ifelse(
+      industry_depth == 5, "2-digit",
+      ifelse(industry_depth == 6, "3-digit", "Aggregate")
+    )
+  ) %>%
+  select(Year, Geography, Variable, Industry, IndustryLevel, Value, UOM)
 
 #save the labour productivity data frame next to this script
 save(lp_data, file = file.path(script_dir(), "lp_data.RData"))
