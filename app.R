@@ -43,12 +43,212 @@ VARIABLE_ORDER <- c(
 
 INDUSTRY_LEVEL_ORDER <- c("Aggregate", "2-digit", "3-digit")
 
+# Plain-language explanation shown below the main panel for the currently
+# selected variable. "Total number of jobs" maps to "" since it needs no
+# explanation -- renderUI treats an empty/missing entry as "show nothing".
+VARIABLE_DEFINITIONS <- c(
+  "Total number of jobs" = "",
+  "Hours worked for all jobs" = "The total number of hours that a person devotes to work, whether paid or unpaid.",
+  "Annual average number of hours worked for all jobs" = "Hours worked for all jobs divided by total number of jobs.",
+  "Total compensation for all jobs" = "All payments in cash or in-kind made by domestic producers to workers for services rendered.",
+  "Nominal value added" = "The dollar value of what an industry produces, minus the cost of the inputs (materials, energy, etc.) it used up to produce it. Measured in today's dollars, so it is affected by inflation.",
+  "Real value added" = "The total dollar value of an industry's output minus the cost of the inputs (materials, energy, etc.) used to produce it. Adjusted by Statistics Canada to 2017 dollars by default, removing the effects of inflation.",
+  "Labour productivity" = "A measure of how efficiently goods and services are produced by workers. Calculated by Statistics Canada as real value added divided by total hours worked.",
+  "Total compensation per hour worked" = "Total compensation for all jobs divided by number of hours worked.",
+  "Unit labour cost" = "Measures the average cost of labour required to produce one unit of output. Calculated by Statistics Canada as the current dollar labour compensation divided by real value added (or equivalently labour compensation per hour worked to labour productivity). It rises when hourly compensation grows faster than labour productivity, and is widely used to measure inflation pressure from wage growth.",
+  "Unit labour cost in US dollars" = "Equivalent to the ratio of the Canadian unit labour cost to the exchange rate (the U.S. dollar value expressed in Canadian dollars, based on the monthly average).",
+  "Labour share" = "The ratio of total compensation as a percentage of the nominal value added."
+)
+
 # The industry_level toggle that selects a maximum level of detail (All levels 
 # include at least aggregate).
 industry_levels_upto <- function(level) {
   idx <- match(level, INDUSTRY_LEVEL_ORDER)
   if (length(idx) == 0 || is.na(idx)) return(character(0))
   INDUSTRY_LEVEL_ORDER[seq_len(idx)]
+}
+
+# Immediate parent of each 2-digit and 3-digit industry, derived once from
+# the "Hierarchy for Industry" dot-path in Stats Canada table 36-10-0480-01
+# (that column isn't kept in lp_data.RData -- only the Industry name and
+# IndustryLevel survive the pipeline). 2-digit sectors nest under Business/
+# Non-business sector industries; 3-digit subsectors nest under their
+# 2-digit sector. Used only to order/indent the Industry picker.
+INDUSTRY_PARENT <- c(
+  "Accommodation and food services" = "Business sector industries",
+  "Administrative and support, waste management and remediation services" = "Business sector industries",
+  "Agriculture, forestry, fishing and hunting" = "Business sector industries",
+  "Arts, entertainment and recreation" = "Business sector industries",
+  "Construction" = "Business sector industries",
+  "Educational services" = "Business sector industries",
+  "Federal government services" = "Non-business sector industries",
+  "Finance and insurance" = "Business sector industries",
+  "Government educational services" = "Non-business sector industries",
+  "Government health services" = "Non-business sector industries",
+  "Health care and social assistance" = "Business sector industries",
+  "Holding companies" = "Business sector industries",
+  "Information and cultural industries" = "Business sector industries",
+  "Local, municipal and Indigenous government services" = "Non-business sector industries",
+  "Manufacturing" = "Business sector industries",
+  "Mining and oil and gas extraction" = "Business sector industries",
+  "Non-profit institutions" = "Non-business sector industries",
+  "Other private services" = "Business sector industries",
+  "Professional, scientific and technical services" = "Business sector industries",
+  "Provincial and territorial government services" = "Non-business sector industries",
+  "Real estate, rental and leasing" = "Business sector industries",
+  "Retail trade" = "Business sector industries",
+  "Transportation and warehousing" = "Business sector industries",
+  "Utilities" = "Business sector industries",
+  "Wholesale trade" = "Business sector industries",
+  "Accommodation services" = "Accommodation and food services",
+  "Activities related to credit intermediation" = "Finance and insurance",
+  "Administrative and support services" = "Administrative and support, waste management and remediation services",
+  "Advertising, public relations, and related services" = "Professional, scientific and technical services",
+  "Air transportation" = "Transportation and warehousing",
+  "Ambulatory health care services ==> Non-profit institutions" = "Non-profit institutions",
+  "Amusement, gambling and recreation industries" = "Arts, entertainment and recreation",
+  "Architectural, engineering and related services" = "Professional, scientific and technical services",
+  "Beverage and tobacco product manufacturing" = "Manufacturing",
+  "Broadcasting (except internet)" = "Information and cultural industries",
+  "Building material and garden equipment and supplies dealers" = "Retail trade",
+  "Building material and supplies wholesaler-distributors" = "Wholesale trade",
+  "Chemical manufacturing" = "Manufacturing",
+  "Clothing and clothing accessories stores" = "Retail trade",
+  "Clothing and leather and allied product manufacturing" = "Manufacturing",
+  "Community colleges and C.E.G.E.P.s" = "Government educational services",
+  "Computer and electronic product manufacturing" = "Manufacturing",
+  "Computer systems design and related services" = "Professional, scientific and technical services",
+  "Crop and animal production" = "Agriculture, forestry, fishing and hunting",
+  "Data processing, hosting, and related services" = "Information and cultural industries",
+  "Defence services" = "Federal government services",
+  "Depository credit intermediation and monetary authorities" = "Finance and insurance",
+  "Electric power generation, transmission and distribution" = "Utilities",
+  "Electrical equipment, appliance and component manufacturing" = "Manufacturing",
+  "Electronics and appliance stores" = "Retail trade",
+  "Elementary and secondary schools" = "Government educational services",
+  "Engineering construction" = "Construction",
+  "Fabricated metal product manufacturing" = "Manufacturing",
+  "Farm product wholesaler-distributors" = "Wholesale trade",
+  "Federal government services (excluding defence)" = "Federal government services",
+  "Financial investment services, funds and other financial vehicles" = "Finance and insurance",
+  "Fishing, hunting and trapping" = "Agriculture, forestry, fishing and hunting",
+  "Food and beverage stores" = "Retail trade",
+  "Food manufacturing" = "Manufacturing",
+  "Food services and drinking places" = "Accommodation and food services",
+  "Food, beverage and tobacco wholesaler-distributors" = "Wholesale trade",
+  "Forestry and logging" = "Agriculture, forestry, fishing and hunting",
+  "Furniture and home furnishings stores" = "Retail trade",
+  "Furniture and related product manufacturing" = "Manufacturing",
+  "Gasoline stations" = "Retail trade",
+  "General merchandise stores" = "Retail trade",
+  "Grant-making, civic, and professional and similar organizations" = "Non-profit institutions",
+  "Health and personal care stores" = "Retail trade",
+  "Health care" = "Health care and social assistance",
+  "Hospitals" = "Government health services",
+  "Indigenous government services" = "Local, municipal and Indigenous government services",
+  "Insurance carriers and related activities" = "Finance and insurance",
+  "Legal, accounting and related services" = "Professional, scientific and technical services",
+  "Lessors of non-financial intangible assets (except copyrighted works)" = "Real estate, rental and leasing",
+  "Machinery manufacturing" = "Manufacturing",
+  "Machinery, equipment and supplies wholesaler-distributors" = "Wholesale trade",
+  "Mining and quarrying (except oil and gas)" = "Mining and oil and gas extraction",
+  "Miscellaneous manufacturing" = "Manufacturing",
+  "Miscellaneous store retailers" = "Retail trade",
+  "Miscellaneous wholesaler-distributors" = "Wholesale trade",
+  "Motion picture and sound recording industries" = "Information and cultural industries",
+  "Motor vehicle and parts dealers" = "Retail trade",
+  "Motor vehicle and parts wholesaler-distributors" = "Wholesale trade",
+  "Municipal government services" = "Local, municipal and Indigenous government services",
+  "Natural gas distribution, water, sewage and other systems" = "Utilities",
+  "Non-depository credit intermediation" = "Finance and insurance",
+  "Non-metallic mineral product manufacturing" = "Manufacturing",
+  "Non-profit arts, entertainment and recreation" = "Non-profit institutions",
+  "Non-profit education institutions" = "Non-profit institutions",
+  "Non-profit welfare organizations" = "Non-profit institutions",
+  "Non-residential building construction" = "Construction",
+  "Non-store retailers" = "Retail trade",
+  "Nursing and residential care facilities ==> Government health services" = "Government health services",
+  "Oil and gas extraction" = "Mining and oil and gas extraction",
+  "Other activities of the construction industry" = "Construction",
+  "Other educational services" = "Government educational services",
+  "Other information services" = "Information and cultural industries",
+  "Other non-profit institutions serving households" = "Non-profit institutions",
+  "Other professional, scientific and technical services including scientific research and development" = "Professional, scientific and technical services",
+  "Paper manufacturing" = "Manufacturing",
+  "Performing arts, spectator sports and related industries, and heritage institutions" = "Arts, entertainment and recreation",
+  "Personal and household goods wholesaler-distributors" = "Wholesale trade",
+  "Personal services and private households" = "Other private services",
+  "Petroleum and coal product manufacturing" = "Manufacturing",
+  "Petroleum product wholesaler-distributors" = "Wholesale trade",
+  "Pipeline transportation" = "Transportation and warehousing",
+  "Plastics and rubber products manufacturing" = "Manufacturing",
+  "Postal service and couriers and messengers" = "Transportation and warehousing",
+  "Primary metal manufacturing" = "Manufacturing",
+  "Printing and related support activities" = "Manufacturing",
+  "Private educational services" = "Educational services",
+  "Professional and similar organizations" = "Other private services",
+  "Publishing industries (except internet)" = "Information and cultural industries",
+  "Rail transportation" = "Transportation and warehousing",
+  "Real estate" = "Real estate, rental and leasing",
+  "Religious organizations" = "Non-profit institutions",
+  "Rental and leasing services" = "Real estate, rental and leasing",
+  "Repair and maintenance" = "Other private services",
+  "Repair construction" = "Construction",
+  "Residential building construction" = "Construction",
+  "Social assistance" = "Health care and social assistance",
+  "Sporting goods, hobby, book and music stores" = "Retail trade",
+  "Support activities for agriculture and forestry" = "Agriculture, forestry, fishing and hunting",
+  "Support activities for mining and oil and gas extraction" = "Mining and oil and gas extraction",
+  "Support activities for transportation" = "Transportation and warehousing",
+  "Telecommunications" = "Information and cultural industries",
+  "Textile and textile product mills" = "Manufacturing",
+  "Transit, ground passenger and scenic and sightseeing transportation" = "Transportation and warehousing",
+  "Transportation equipment manufacturing" = "Manufacturing",
+  "Truck transportation" = "Transportation and warehousing",
+  "Universities" = "Government educational services",
+  "Warehousing and storage" = "Transportation and warehousing",
+  "Waste management and remediation services" = "Administrative and support, waste management and remediation services",
+  "Water transportation" = "Transportation and warehousing",
+  "Wholesale electronic markets, and agents and brokers" = "Wholesale trade",
+  "Wood product manufacturing" = "Manufacturing"
+)
+
+# Industry choices for the compare-picker, ordered so each industry
+# immediately follows its parent (root aggregates, then their 2-digit
+# children, then each 2-digit's 3-digit children) and indented with
+# non-breaking spaces per level -- so it's visually clear which sector a
+# subsector belongs to instead of one flat alphabetical list. Values stay
+# the plain Industry name; only the displayed label is indented.
+industry_choices_tree <- function(df) {
+  available <- unique(df$Industry)
+  order <- character(0)
+  labels <- character(0)
+
+  add_children <- function(parent, depth) {
+    children <- sort(available[match(available, names(INDUSTRY_PARENT), 0L) > 0 &
+                                  INDUSTRY_PARENT[available] == parent])
+    for (child in children) {
+      order <<- c(order, child)
+      labels <<- c(labels, paste0(strrep("    ", depth), child))
+      add_children(child, depth + 1)
+    }
+  }
+
+  roots <- intersect(c("All industries", "Business sector industries", "Non-business sector industries"), available)
+  for (r in roots) {
+    order <- c(order, r)
+    labels <- c(labels, r)
+    add_children(r, 1)
+  }
+
+  # Anything present but not reachable from the roots above (e.g. a future
+  # industry not yet mapped in INDUSTRY_PARENT) still shows up, unindented,
+  # rather than silently disappearing from the picker.
+  leftover <- sort(setdiff(available, order))
+  order <- c(order, leftover)
+  labels <- c(labels, leftover)
+
+  setNames(order, labels)
 }
 
 # data_pipeline.R pulls Stats Canada table 36-10-0480-01 then shapes/
@@ -190,17 +390,36 @@ ui <- function(request) {
       # the first real choice. The default series is still there, just
       # already-applied under "Series to compare" via default_pair_row().
       selectizeInput(
+        "pair_industry", "Industry",
+        choices = c("", industry_choices_tree(
+          init_df[init_df$IndustryLevel %in% industry_levels_upto(DEFAULT_INDUSTRY_LEVEL), ]
+        )),
+        selected = character(0),
+        options = list(
+          placeholder = "Search industries...",
+          # Leading non-breaking spaces on the label only indent the first
+          # line of a wrapped option -- render as padding-left on the whole
+          # option div instead, so long industry names wrap without their
+          # second line snapping back to the left edge.
+          render = I("{
+            option: function(item, escape) {
+              var text = item.label, depth = 0;
+              while (text.charCodeAt(depth) === 160) depth++;
+              return '<div style=\"padding-left:' + (depth * 4) + 'px\">' +
+                escape(text.slice(depth)) + '</div>';
+            },
+            item: function(item, escape) {
+              var text = item.label, depth = 0;
+              while (text.charCodeAt(depth) === 160) depth++;
+              return '<div>' + escape(text.slice(depth)) + '</div>';
+            }
+          }")
+        )
+      ),
+      selectizeInput(
         "pair_geography", "Geography",
         choices = c("", GEOGRAPHY_ORDER), selected = character(0),
         options = list(placeholder = "Search geographies...")
-      ),
-      selectizeInput(
-        "pair_industry", "Industry",
-        choices = c("", series_choices(
-          init_df[init_df$IndustryLevel %in% industry_levels_upto(DEFAULT_INDUSTRY_LEVEL), ], "Industry", DEFAULT_INDUSTRY
-        )),
-        selected = character(0),
-        options = list(placeholder = "Search industries...")
       ),
       actionButton("add_pair", "Add series", icon = icon("plus")),
       checkboxGroupInput(
@@ -257,7 +476,8 @@ ui <- function(request) {
         plotlyOutput("ranking_chart", height = "480px")
       ),
       nav_panel("Data Table", DTOutput("data_table"))
-    )
+    ),
+    uiOutput("variable_definition")
   )
 }
 
@@ -317,7 +537,7 @@ server <- function(input, output, session) {
   # resolved to a concrete Industry regardless of level.
   observeEvent(input$industry_level, {
     df <- raw_data() %>% filter(IndustryLevel %in% industry_levels_upto(input$industry_level))
-    choices <- series_choices(df, "Industry", DEFAULT_INDUSTRY)
+    choices <- industry_choices_tree(df)
     req(length(choices) > 0)
 
     current <- input$pair_industry
@@ -630,6 +850,12 @@ server <- function(input, output, session) {
       df, rownames = FALSE, options = list(pageLength = 15),
       colnames = unname(export_column_labels(names(df), input$base_year, input$variable, variable_uom()))
     )
+  })
+
+  output$variable_definition <- renderUI({
+    def <- VARIABLE_DEFINITIONS[[input$variable]]
+    if (is.null(def) || !nzchar(def)) return(NULL)
+    p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
   })
 
   output$download_csv <- downloadHandler(
