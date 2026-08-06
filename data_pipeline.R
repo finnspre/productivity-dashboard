@@ -53,7 +53,13 @@ lp_data <- lp_data %>%
     Value = as.numeric(VALUE),
     Geography = as.character(Geography),
     Variable = as.character(Variable),
-    Industry = as.character(Industry),
+    # A handful of 3-digit industries come back from Statistics Canada named
+    # "X ==> Y" (e.g. "Ambulatory health care services ==> Non-profit
+    # institutions") -- Y there is just the true parent under this table's
+    # non-commercial-activity reclassification, which app.R's
+    # INDUSTRY_PARENT already encodes for the plain name. Strip the
+    # "==> ..." suffix so the plain name is what's stored/displayed.
+    Industry = sub("\\s*==>.*$", "", as.character(Industry)),
     IndustryLevel = ifelse(
       industry_depth == 5, "2-digit",
       ifelse(industry_depth == 6, "3-digit", "Aggregate")

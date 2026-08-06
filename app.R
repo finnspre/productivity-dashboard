@@ -26,7 +26,6 @@ FONT_FAMILY <- "Roboto, sans-serif"
 
 DEFAULT_VARIABLE <- "Labour productivity"
 DEFAULT_GEOGRAPHY <- "Canada"
-DEFAULT_INDUSTRY_LEVEL <- "Aggregate"
 DEFAULT_INDUSTRY <- "All industries"
 
 GEOGRAPHY_ORDER <- c(
@@ -41,8 +40,6 @@ VARIABLE_ORDER <- c(
   "Total compensation for all jobs", "Total compensation per hour worked",
   "Unit labour cost", "Unit labour cost in US dollars", "Labour share"
 )
-
-INDUSTRY_LEVEL_ORDER <- c("Aggregate", "2-digit", "3-digit")
 
 # Plain-language explanation shown below the main panel for the currently
 # selected variable. "Total number of jobs" maps to "" since it needs no
@@ -60,14 +57,6 @@ VARIABLE_DEFINITIONS <- c(
   "Unit labour cost in US dollars" = "Equivalent to the ratio of the Canadian unit labour cost to the exchange rate (the U.S. dollar value expressed in Canadian dollars, based on the monthly average).",
   "Labour share" = "The ratio of total compensation as a percentage of the nominal value added."
 )
-
-# The industry_level toggle that selects a maximum level of detail (All levels 
-# include at least aggregate).
-industry_levels_upto <- function(level) {
-  idx <- match(level, INDUSTRY_LEVEL_ORDER)
-  if (length(idx) == 0 || is.na(idx)) return(character(0))
-  INDUSTRY_LEVEL_ORDER[seq_len(idx)]
-}
 
 # Immediate parent of each 2-digit and 3-digit industry, derived once from
 # the "Hierarchy for Industry" dot-path in Stats Canada table 36-10-0480-01
@@ -106,7 +95,7 @@ INDUSTRY_PARENT <- c(
   "Administrative and support services" = "Administrative and support, waste management and remediation services",
   "Advertising, public relations, and related services" = "Professional, scientific and technical services",
   "Air transportation" = "Transportation and warehousing",
-  "Ambulatory health care services ==> Non-profit institutions" = "Non-profit institutions",
+  "Ambulatory health care services" = "Non-profit institutions",
   "Amusement, gambling and recreation industries" = "Arts, entertainment and recreation",
   "Architectural, engineering and related services" = "Professional, scientific and technical services",
   "Beverage and tobacco product manufacturing" = "Manufacturing",
@@ -168,7 +157,7 @@ INDUSTRY_PARENT <- c(
   "Non-profit welfare organizations" = "Non-profit institutions",
   "Non-residential building construction" = "Construction",
   "Non-store retailers" = "Retail trade",
-  "Nursing and residential care facilities ==> Government health services" = "Government health services",
+  "Nursing and residential care facilities" = "Government health services",
   "Oil and gas extraction" = "Mining and oil and gas extraction",
   "Other activities of the construction industry" = "Construction",
   "Other educational services" = "Government educational services",
@@ -264,7 +253,16 @@ load_lp_data <- function(path = LP_DATA_FILE) {
   }
   e <- new.env()
   load(path, envir = e)
-  e$lp_data
+  df <- e$lp_data
+  # A handful of 3-digit industries come back from Statistics Canada named
+  # "X ==> Y" (e.g. "Ambulatory health care services ==> Non-profit
+  # institutions") -- Y there is just the true parent under this table's
+  # non-commercial-activity reclassification, which INDUSTRY_PARENT already
+  # encodes. Strip the "==> ..." suffix so the picker shows the plain
+  # industry name and INDUSTRY_PARENT nests it under its real parent instead
+  # of it dangling, unindented, as its own oddly-named entry.
+  df$Industry <- sub("\\s*==>.*$", "", df$Industry)
+  df
 }
 # Check lp_data.RData for modifications every 6000 seconds (10 minutes) by default
 # but allow tests to override this to avoid waiting 10 real minutes for a test to exercise the reactiveFileReader.
@@ -362,8 +360,284 @@ export_column_labels <- function(cols, base_year, variable, uom) {
   labels[cols]
 }
 
+# The Trends tab: a focused single-series view (one Variable + one
+# Geography + one Industry -> one line), unlike the other 3 tabs which
+# still compare multiple (Industry, Geography) pairs at once. Kept as its
+# own dedicated module rather than another "kind" of tab_module_ui/
+# tab_module_server below, since its sidebar shape and reactive pipeline
+# are genuinely different (no active_pairs/Add-series/multi-color
+# machinery), not just a different final render step.
+trend_tab_ui <- function(id, init_df) {
+  ns <- NS(id)
+
+  card(
+    layout_sidebar(
+      sidebar = sidebar(
+        id = ns("sidebar"),
+        selectInput(
+          ns("variable"), "Variable",
+          choices = series_choices(init_df, "Variable", VARIABLE_ORDER), selected = DEFAULT_VARIABLE
+        ),
+        selectInput(
+          ns("geography"), "Geography",
+          choices = series_choices(init_df, "Geography", GEOGRAPHY_ORDER), selected = DEFAULT_GEOGRAPHY,
+          selectize = FALSE
+        ),
+        # Always the full Aggregate+2-digit+3-digit tree -- no separate
+        # industry_level toggle (none of the tabs have one).
+        selectizeInput(
+          ns("industry"), "Industry",
+          choices = industry_choices_tree(init_df), selected = DEFAULT_INDUSTRY,
+          options = list(
+            placeholder = "Search industries...",
+            # Same indentation-that-survives-wrapped-lines trick as the
+            # other tabs' Industry picker -- see their comment for why.
+            render = I("{
+              option: function(item, escape) {
+                var text = item.label, depth = 0;
+                while (text.charCodeAt(depth) === 160) depth++;
+                return '<div style=\"padding-left:' + (depth * 4) + 'px\">' +
+                  escape(text.slice(depth)) + '</div>';
+              },
+              item: function(item, escape) {
+                var text = item.label, depth = 0;
+                while (text.charCodeAt(depth) === 160) depth++;
+                return '<div>' + escape(text.slice(depth)) + '</div>';
+              }
+            }")
+          )
+        ),
+        # A native <details> disclosure -- zero extra JS dependencies,
+        # keyboard-accessible by default. Verified (headless-browser +
+        # shinytest2) that a sliderInput initialized while collapsed inside
+        # this renders and syncs identically to one that was never hidden,
+        # so no "re-init on open" workaround is needed.
+        tags$details(
+          id = ns("more_options"), class = "trend-more-options",
+          tags$summary("More options"),
+          sliderInput(
+            ns("year_range"), "Time frame",
+            min = min(init_df$Year), max = max(init_df$Year),
+            value = c(min(init_df$Year), max(init_df$Year)),
+            step = 1, sep = ""
+          ),
+          radioButtons(
+            ns("view_mode"), "Measure",
+            choices = c("Index level" = "level", "Annual growth %" = "growth"),
+            selected = "level", inline = TRUE
+          ),
+          conditionalPanel(
+            "input.view_mode == 'level'", ns = ns,
+            checkboxInput(ns("rebase_toggle"), "Rebase to a base year", value = FALSE),
+            conditionalPanel(
+              "input.view_mode == 'level' && input.rebase_toggle == true", ns = ns,
+              selectInput(
+                ns("base_year"), "Base year",
+                choices = sort(unique(init_df$Year)), selected = min(init_df$Year),
+                selectize = FALSE
+              )
+            )
+          ),
+          downloadButton(ns("download_csv"), "Download CSV", icon = icon("download"))
+        ),
+        p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
+      ),
+      plotlyOutput(ns("chart"), height = "100%"),
+      uiOutput(ns("variable_definition"))
+    )
+  )
+}
+
+trend_tab_server <- function(id, raw_data) {
+  moduleServer(id, function(input, output, session) {
+
+    # Keeps Variable/Geography/Industry/time-frame/base-year in sync with
+    # what's in the data, preserving the user's current picks where still
+    # valid. Unlike the multi-pair tabs, an invalid pick falls back to the
+    # DEFAULT_* constants rather than going blank -- Geography/Industry are
+    # always-active single selections here, not an "add to compare" picker
+    # that's allowed to sit empty.
+    observe({
+      df <- raw_data()
+
+      variable_choices <- series_choices(df, "Variable", VARIABLE_ORDER)
+      new_variable <- if (is.null(input$variable) || !(input$variable %in% variable_choices)) {
+        DEFAULT_VARIABLE
+      } else {
+        input$variable
+      }
+      updateSelectInput(session, "variable", choices = variable_choices, selected = new_variable)
+
+      geo_choices <- series_choices(df, "Geography", GEOGRAPHY_ORDER)
+      new_geo <- if (is.null(input$geography) || !(input$geography %in% geo_choices)) {
+        DEFAULT_GEOGRAPHY
+      } else {
+        input$geography
+      }
+      updateSelectInput(session, "geography", choices = geo_choices, selected = new_geo)
+
+      industry_choices <- industry_choices_tree(df)
+      new_industry <- if (is.null(input$industry) || !(input$industry %in% industry_choices)) {
+        DEFAULT_INDUSTRY
+      } else {
+        input$industry
+      }
+      updateSelectizeInput(session, "industry", choices = industry_choices, selected = new_industry)
+
+      year_min <- min(df$Year)
+      year_max <- max(df$Year)
+      current_range <- input$year_range
+      range_value <- if (is.null(current_range)) {
+        c(year_min, year_max)
+      } else {
+        c(max(current_range[1], year_min), min(current_range[2], year_max))
+      }
+      updateSliderInput(session, "year_range", min = year_min, max = year_max, value = range_value)
+
+      year_choices <- sort(unique(df$Year))
+      current_base <- suppressWarnings(as.numeric(input$base_year))
+      new_base <- if (is.null(input$base_year) || is.na(current_base) || !(current_base %in% year_choices)) {
+        min(year_choices)
+      } else {
+        current_base
+      }
+      updateSelectInput(session, "base_year", choices = year_choices, selected = new_base)
+    }) |> bindEvent(raw_data(), once = FALSE)
+
+    # Single (Variable, Industry, Geography) match -- no SeriesLabel
+    # filtering/looping needed, but SeriesLabel is still added so
+    # build_export_df()/export_column_labels() work completely unchanged.
+    scoped_raw <- reactive({
+      req(input$variable, input$industry, input$geography)
+      raw_data() %>%
+        filter(Variable == input$variable, Industry == input$industry, Geography == input$geography) %>%
+        mutate(SeriesLabel = pair_label(input$industry, input$geography))
+    })
+
+    variable_uom <- reactive({
+      vals <- raw_data() %>% filter(Variable == input$variable) %>% pull(UOM)
+      vals[1]
+    })
+
+    history_with_growth <- reactive({
+      validate(need(nrow(scoped_raw()) > 0, "No data for this variable/industry/geography combination."))
+      scoped_raw() %>%
+        arrange(Year) %>%
+        mutate(GrowthPct = (Value / lag(Value) - 1) * 100)
+    })
+
+    transform_result <- reactive({
+      df <- history_with_growth()
+      base_year_num <- suppressWarnings(as.numeric(input$base_year))
+
+      if (isTRUE(input$rebase_toggle) && !is.na(base_year_num)) {
+        base_row <- df %>% filter(Year == base_year_num)
+        has_base <- nrow(base_row) > 0
+        df$RebasedValue <- if (has_base) df$Value / base_row$Value[1] * 100 else NA_real_
+      } else {
+        df$RebasedValue <- NA_real_
+        has_base <- TRUE
+      }
+
+      df$DisplayValue <- if (identical(input$view_mode, "growth")) {
+        df$GrowthPct
+      } else if (isTRUE(input$rebase_toggle)) {
+        df$RebasedValue
+      } else {
+        df$Value
+      }
+
+      list(df = df, missing_base = isTRUE(input$rebase_toggle) && !has_base)
+    })
+
+    display_data <- reactive(transform_result()$df)
+
+    rebase_missing <- reactive({
+      if (identical(input$view_mode, "growth")) FALSE else isTRUE(transform_result()$missing_base)
+    })
+
+    observeEvent(rebase_missing(), {
+      if (isTRUE(rebase_missing())) {
+        showNotification(
+          paste0(
+            "No ", input$base_year, " data for this series -- excluded from the rebased view."
+          ),
+          type = "warning"
+        )
+      }
+    })
+
+    filtered_data <- reactive({
+      req(input$year_range)
+      display_data() %>%
+        filter(Year >= input$year_range[1], Year <= input$year_range[2])
+    })
+
+    output$chart <- renderPlotly({
+      df <- filtered_data() %>% filter(!is.na(DisplayValue)) %>% arrange(Year)
+      req(nrow(df) > 0)
+      axis_title <- display_axis_title(input$view_mode, input$rebase_toggle, input$base_year, input$variable, variable_uom())
+      hover_suffix <- if (identical(input$view_mode, "growth")) "%" else ""
+      line_color <- CATEGORICAL_PALETTE[1]
+      # Chart title only states the variable/timeframe -- with a single
+      # line there's no legend to identify which industry/geography it is,
+      # so name the pair as a subtitle and in the hover text instead.
+      subtitle <- pair_label(input$industry, input$geography)
+
+      plot_ly(
+        data = df, x = ~Year, y = ~DisplayValue,
+        type = "scatter", mode = "lines+markers",
+        line = list(color = line_color, width = 2),
+        marker = list(color = line_color, size = 7),
+        hovertemplate = paste0(subtitle, "<br>%{x}: %{y:.1f}", hover_suffix, "<extra></extra>")
+      ) %>%
+        layout(
+          title = list(text = paste0(
+            display_chart_title(input$variable, input$year_range),
+            "<br><sup style='color:", INK_MUTED, "'>", subtitle, "</sup>"
+          )),
+          xaxis = list(title = "Year", dtick = 1, gridcolor = GRIDLINE, color = INK_MUTED),
+          yaxis = list(title = axis_title, gridcolor = GRIDLINE, color = INK_MUTED),
+          paper_bgcolor = CHART_SURFACE, plot_bgcolor = CHART_SURFACE,
+          font = list(color = INK_PRIMARY, family = FONT_FAMILY),
+          showlegend = FALSE
+        )
+    })
+
+    output$variable_definition <- renderUI({
+      def <- VARIABLE_DEFINITIONS[[input$variable]]
+      if (is.null(def) || !nzchar(def)) return(NULL)
+      p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
+    })
+
+    output$download_csv <- downloadHandler(
+      filename = function() {
+        mode_part <- if (identical(input$view_mode, "growth")) {
+          "annual-growth"
+        } else if (isTRUE(input$rebase_toggle)) {
+          paste0("rebased-", input$base_year)
+        } else {
+          "index"
+        }
+        sprintf(
+          "productivity_%s_%s_%s_%s_%s-%s_%s.csv",
+          gsub("[^A-Za-z0-9]+", "-", input$variable),
+          gsub("[^A-Za-z0-9]+", "-", input$industry),
+          gsub("[^A-Za-z0-9]+", "-", input$geography),
+          mode_part, input$year_range[1], input$year_range[2], format(Sys.Date(), "%Y%m%d")
+        )
+      },
+      content = function(file) {
+        df <- build_export_df(filtered_data(), input$rebase_toggle, input$base_year)
+        write.csv(df, file, row.names = FALSE)
+      }
+    )
+  })
+}
+
 # One tab's worth of sidebar + main content, namespaced under `id` so each
-# of the 4 tabs (kind = "trend" | "bar" | "ranking" | "table") gets its own
+# of the 3 remaining tabs (kind = "bar" | "ranking" | "table" -- Trends now
+# has its own dedicated trend_tab_ui/trend_tab_server above) gets its own
 # fully independent Variable/Compare/Display state instead of sharing one
 # page-level sidebar. `ns = ns` on conditionalPanel is what makes the
 # condition strings below resolve against THIS tab's namespaced widgets
@@ -378,10 +652,10 @@ tab_module_ui <- function(id, init_df, kind) {
         ns("ranking_chart_type"), "Chart type",
         choices = c("Bar" = "bar", "Scatter" = "scatter"), selected = "bar", inline = TRUE
       ),
-      plotlyOutput(ns("chart"), height = "480px")
+      plotlyOutput(ns("chart"), height = "100%")
     ),
     table = DTOutput(ns("chart")),
-    plotlyOutput(ns("chart"), height = "480px")
+    plotlyOutput(ns("chart"), height = "100%")
   )
 
   card(
@@ -392,11 +666,6 @@ tab_module_ui <- function(id, init_df, kind) {
           ns("variable"), "Variable",
           choices = series_choices(init_df, "Variable", VARIABLE_ORDER), selected = DEFAULT_VARIABLE
         ),
-        radioButtons(
-          ns("industry_level"), "Industry detail",
-          choices = c("Aggregate" = "Aggregate", "2-digit sector" = "2-digit", "3-digit subsector" = "3-digit"),
-          selected = DEFAULT_INDUSTRY_LEVEL, inline = TRUE
-        ),
         tags$strong("Compare"),
         # A leading "" choice is what makes a genuinely empty starting
         # selection possible -- with no option marked selected, the browser's
@@ -405,11 +674,11 @@ tab_module_ui <- function(id, init_df, kind) {
         # blank (showing the placeholder) instead of silently defaulting to
         # the first real choice. The default series is still there, just
         # already-applied under "Series to compare" via default_pair_row().
+        # Always the full Aggregate+2-digit+3-digit tree -- no industry_level
+        # toggle, matching the Trends tab.
         selectizeInput(
           ns("pair_industry"), "Industry",
-          choices = c("", industry_choices_tree(
-            init_df[init_df$IndustryLevel %in% industry_levels_upto(DEFAULT_INDUSTRY_LEVEL), ]
-          )),
+          choices = c("", industry_choices_tree(init_df)),
           selected = character(0),
           options = list(
             placeholder = "Search industries...",
@@ -480,10 +749,11 @@ tab_module_ui <- function(id, init_df, kind) {
   )
 }
 
-# Reactive pipeline shared by all 4 tabs, only diverging at the final
-# render step (kind-specific chart/table). Instantiated once per tab id so
-# each tab's Variable/Compare/Display selections are fully independent --
-# module namespacing (see tab_module_ui) is what makes 4 simultaneous
+# Reactive pipeline shared by the 3 remaining tabs (kind = "bar" | "ranking"
+# | "table"), only diverging at the final render step (kind-specific
+# chart/table). Instantiated once per tab id so each tab's
+# Variable/Compare/Display selections are fully independent -- module
+# namespacing (see tab_module_ui) is what makes multiple simultaneous
 # copies of the same widget ids possible in one page.
 tab_module_server <- function(id, raw_data, kind) {
   moduleServer(id, function(input, output, session) {
@@ -492,8 +762,9 @@ tab_module_server <- function(id, raw_data, kind) {
     # sync with what's available in the data (added/removed whenever
     # RAW_DATA_READER's shared file-watcher picks up a new pipeline run),
     # preserving the user's current picks -- clamped to the new bounds --
-    # where possible. Industry choices are handled separately below, since
-    # they depend on the industry_level toggle rather than raw_data() alone.
+    # where possible. This only affects what's *offered* when adding a new
+    # pair -- pairs already in active_pairs() are unaffected, since they're
+    # already resolved to a concrete Industry/Geography.
     observe({
       df <- raw_data()
 
@@ -515,6 +786,15 @@ tab_module_server <- function(id, raw_data, kind) {
       }
       updateSelectizeInput(session, "pair_geography", choices = c("", geo_choices), selected = new_geo)
 
+      industry_choices <- industry_choices_tree(df)
+      current_industry <- input$pair_industry
+      new_industry <- if (is.null(current_industry) || !(current_industry %in% industry_choices)) {
+        character(0)
+      } else {
+        current_industry
+      }
+      updateSelectizeInput(session, "pair_industry", choices = c("", industry_choices), selected = new_industry)
+
       year_min <- min(df$Year)
       year_max <- max(df$Year)
       current_range <- input$year_range
@@ -534,20 +814,6 @@ tab_module_server <- function(id, raw_data, kind) {
       }
       updateSliderInput(session, "base_year", min = year_min, max = year_max, value = new_base)
     }) |> bindEvent(raw_data(), once = FALSE)
-
-    # Keeps the pair-builder's Industry picker in sync with the industry_level
-    # toggle. This only affects what's *offered* when adding a new pair --
-    # pairs already in active_pairs() are unaffected, since they're already
-    # resolved to a concrete Industry regardless of level.
-    observeEvent(input$industry_level, {
-      df <- raw_data() %>% filter(IndustryLevel %in% industry_levels_upto(input$industry_level))
-      choices <- industry_choices_tree(df)
-      req(length(choices) > 0)
-
-      current <- input$pair_industry
-      new_selected <- if (!is.null(current) && current %in% choices) current else character(0)
-      updateSelectizeInput(session, "pair_industry", choices = c("", choices), selected = new_selected)
-    }, ignoreNULL = FALSE)
 
     # The set of (Industry, Geography) pairs currently being compared --
     # replaces the old compare_mode-driven industries_multi/geos_multi/
@@ -748,53 +1014,7 @@ tab_module_server <- function(id, raw_data, kind) {
       })
     } else {
       output$chart <- renderPlotly({
-        if (kind == "trend") {
-          df <- filtered_data() %>% filter(!is.na(DisplayValue))
-          req(nrow(df) > 0)
-          pal <- colors()
-          series <- series_choices(df, "SeriesLabel")
-          axis_title <- display_axis_title(input$view_mode, input$rebase_toggle, input$base_year, input$variable, variable_uom())
-          hover_suffix <- if (identical(input$view_mode, "growth")) "%" else ""
-
-          p <- plot_ly()
-          for (s in series) {
-            sd <- df %>% filter(SeriesLabel == s) %>% arrange(Year)
-            if (nrow(sd) == 0) next
-            p <- p %>% add_trace(
-              data = sd, x = ~Year, y = ~DisplayValue,
-              type = "scatter", mode = "lines+markers",
-              name = s, legendgroup = s,
-              line = list(color = pal[[s]], width = 2),
-              marker = list(color = pal[[s]], size = 7),
-              hovertemplate = paste0("%{x}<br>", s, ": %{y:.1f}", hover_suffix, "<extra></extra>")
-            )
-          }
-
-          label_points <- df %>%
-            group_by(SeriesLabel) %>%
-            filter(Year == max(Year)) %>%
-            ungroup()
-
-          p <- p %>% add_annotations(
-            data = label_points,
-            x = ~Year, y = ~DisplayValue, text = ~SeriesLabel,
-            xanchor = "left", yanchor = "middle", xshift = 8,
-            showarrow = FALSE, font = list(color = INK_PRIMARY, size = 11, family = FONT_FAMILY)
-          )
-
-          p %>% layout(
-            title = display_chart_title(input$variable, input$year_range),
-            xaxis = list(title = "Year", dtick = 1, gridcolor = GRIDLINE, color = INK_MUTED,
-                         range = c(min(df$Year), max(df$Year) + 2.2)),
-            yaxis = list(title = axis_title, gridcolor = GRIDLINE, color = INK_MUTED),
-            paper_bgcolor = CHART_SURFACE, plot_bgcolor = CHART_SURFACE,
-            font = list(color = INK_PRIMARY, family = FONT_FAMILY),
-            legend = list(orientation = "h", y = -0.2)
-          )
-        } else if (kind == "bar") {
-          # Same data/series/axis logic as the trend chart, just plotted as
-          # vertical bars (one cluster of bars per year) instead of
-          # lines+markers.
+        if (kind == "bar") {
           df <- filtered_data() %>% filter(!is.na(DisplayValue))
           req(nrow(df) > 0)
           pal <- colors()
@@ -898,7 +1118,7 @@ ui <- function(request) {
   # already present in the first HTML the browser receives.
   init_df <- load_lp_data()
 
-  page(
+  page_fillable(
     title = "Canadian Productivity Dashboard", # browser tab title only -- no on-page heading
     # page() renders straight into <body> with no margin/padding of its
     # own, so the intro text would otherwise butt right up against the
@@ -906,15 +1126,38 @@ ui <- function(request) {
     #
     # nav-pills only puts a visible background on the *active* pill by
     # default -- give every pill a border + margin so all 4 read as
-    # distinct, slightly-rounded buttons with a gap between them, not one
-    # continuous flush bar with just the selected segment highlighted.
+    # distinct, fully-rounded (pill/capsule-shaped, not just rounded-corner)
+    # buttons with a gap between them, not one continuous flush bar with
+    # just the selected segment highlighted. margin-bottom on the row
+    # itself puts a little breathing room between the buttons and the card
+    # below them.
     tags$style(HTML(
       "body { padding: 2rem 2.5rem; }
-       .nav-pills .nav-link { border: 1px solid var(--bs-border-color, #dee2e6); border-radius: 0.5rem; margin: 0 0.25rem; }"
+       .nav-pills { margin-bottom: 1rem; }
+       .nav-pills .nav-link { border: 1px solid var(--bs-border-color, #dee2e6); border-radius: 50rem; margin: 0 0.25rem; }
+       .trend-more-options > summary { cursor: pointer; list-style: none; display: flex; align-items: center;
+         gap: 0.35rem; color: var(--bs-link-color, #0d6efd); font-size: 0.9rem; margin-bottom: 0.5rem; }
+       .trend-more-options > summary::-webkit-details-marker { display: none; }
+       .trend-more-options > summary::before { content: '\\25B8'; transition: transform 0.15s ease; }
+       .trend-more-options[open] > summary::before { transform: rotate(90deg); }
+       /* page_fillable() makes <body> a fill-height flex column, but
+          navset_pill()'s .tabbable/.tab-content/.tab-pane wrapper markup
+          is all plain block, none of it a flex container passing that
+          fill height further down -- without these three, the card
+          (which bslib DOES mark fill-aware) never receives a stretched
+          height to fill. */
+       .tabbable { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+       .tab-content { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+       .tab-content > .tab-pane.active { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+       /* bslib's own .card.html-fill-item CSS defaults to flex: 0 1 auto
+          (content-sized, not growing) -- override just the one directly
+          inside our now-fillable tab pane so it actually claims the space
+          the layers above are now correctly offering it. */
+       .tab-pane.active > .card { flex: 1 1 auto; min-height: 0; }"
     )),
     p(
       class = "text-muted",
-      style = "margin-bottom: 1.5rem;",
+      style = "margin-bottom: 1.25rem;",
       "Use this data dashboard to explore labour productivity trends across Canadian industries ",
       "using Statistics Canada data. Compare industries over time, examine recent growth and ",
       "customized subperiods, rank long-run performance, and download underlying data."
@@ -922,11 +1165,18 @@ ui <- function(request) {
     # navset_pill (button-styled tabs) + nav-justified (stretched to fill
     # the page width in equal-width segments) instead of the default
     # left-aligned, content-width nav-tabs underline style.
+    #
+    # Depends on bslib's internal navset_pill() markup exposing a
+    # "ul.nav" element to target -- if a future bslib version restructures
+    # that, find() just matches nothing and addClass() is then a no-op
+    # (verified: this degrades to un-justified tabs, it does not error or
+    # break tab switching), so a bslib upgrade is a "check this still looks
+    # right" item, not a "the app is broken" risk.
     tagQuery(
       navset_pill(
-        nav_panel("Trends", tab_module_ui("trend", init_df, "trend")),
-        nav_panel("Compare", tab_module_ui("bar", init_df, "bar")),
+        nav_panel("Trends", trend_tab_ui("trend", init_df)),
         nav_panel("Rankings", tab_module_ui("ranking", init_df, "ranking")),
+        nav_panel("Compare", tab_module_ui("bar", init_df, "bar")),
         nav_panel("Data", tab_module_ui("table", init_df, "table"))
       )
     )$find("ul.nav")$addClass("nav-justified")$allTags()
@@ -936,9 +1186,9 @@ ui <- function(request) {
 server <- function(input, output, session) {
   raw_data <- RAW_DATA_READER # single shared reactiveFileReader, not duplicated per tab
 
-  tab_module_server("trend", raw_data, "trend")
-  tab_module_server("bar", raw_data, "bar")
+  trend_tab_server("trend", raw_data)
   tab_module_server("ranking", raw_data, "ranking")
+  tab_module_server("bar", raw_data, "bar")
   tab_module_server("table", raw_data, "table")
 }
 
