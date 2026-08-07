@@ -41,6 +41,12 @@ VARIABLE_ORDER <- c(
   "Unit labour cost", "Unit labour cost in US dollars", "Labour share"
 )
 
+# The Industry detail toggle on the Rankings tab -- selects a *maximum*
+# level of detail, not an exact one, so "3-digit" still includes the
+# Aggregate and 2-digit rows too (see industry_levels_upto() below).
+DEFAULT_INDUSTRY_LEVEL <- "Aggregate"
+INDUSTRY_LEVEL_ORDER <- c("Aggregate", "2-digit", "3-digit")
+
 # Plain-language explanation shown below the main panel for the currently
 # selected variable. "Total number of jobs" maps to "" since it needs no
 # explanation -- renderUI treats an empty/missing entry as "show nothing".
@@ -57,6 +63,15 @@ VARIABLE_DEFINITIONS <- c(
   "Unit labour cost in US dollars" = "Equivalent to the ratio of the Canadian unit labour cost to the exchange rate (the U.S. dollar value expressed in Canadian dollars, based on the monthly average).",
   "Labour share" = "The ratio of total compensation as a percentage of the nominal value added."
 )
+
+# Levels up to and including `level` -- e.g. "2-digit" resolves to
+# c("Aggregate", "2-digit"), so picking a detail level always keeps the
+# coarser rows too rather than switching to only that one level.
+industry_levels_upto <- function(level) {
+  idx <- match(level, INDUSTRY_LEVEL_ORDER)
+  if (length(idx) == 0 || is.na(idx)) return(character(0))
+  INDUSTRY_LEVEL_ORDER[seq_len(idx)]
+}
 
 # Immediate parent of each 2-digit and 3-digit industry, derived once from
 # the "Hierarchy for Industry" dot-path in Stats Canada table 36-10-0480-01
@@ -635,25 +650,218 @@ trend_tab_server <- function(id, raw_data) {
   })
 }
 
+# The Rankings tab: pick one Variable + one Geography (+ a maximum Industry
+# detail level), see every matching industry's compound annual growth rate
+# (CAGR) over the full time span of the data, as a scatter plot. Unlike
+# Trends/Compare there's no picker for a *specific* industry -- all
+# industries up to the chosen detail level are shown at once -- so this gets
+# its own dedicated module rather than another tab_module_ui/
+# tab_module_server "kind", same reasoning as the Trends tab.
+ranking_tab_ui <- function(id, init_df) {
+  ns <- NS(id)
+
+  card(
+    layout_sidebar(
+      sidebar = sidebar(
+        id = ns("sidebar"),
+        selectInput(
+          ns("variable"), "Variable",
+          choices = series_choices(init_df, "Variable", VARIABLE_ORDER), selected = DEFAULT_VARIABLE
+        ),
+        selectInput(
+          ns("geography"), "Geography",
+          choices = series_choices(init_df, "Geography", GEOGRAPHY_ORDER), selected = DEFAULT_GEOGRAPHY,
+          selectize = FALSE
+        ),
+        sliderInput(
+          ns("year_range"), "Time frame",
+          min = min(init_df$Year), max = max(init_df$Year),
+          value = c(min(init_df$Year), max(init_df$Year)),
+          step = 1, sep = ""
+        ),
+        radioButtons(
+          ns("industry_level"), "Industry detail",
+          choices = c("Aggregate" = "Aggregate", "2-digit sector" = "2-digit", "3-digit subsector" = "3-digit"),
+          selected = DEFAULT_INDUSTRY_LEVEL, inline = TRUE
+        ),
+        radioButtons(
+          ns("chart_type"), "Chart type",
+          choices = c("Scatter" = "scatter", "Bar" = "bar"), selected = "bar", inline = TRUE
+        ),
+        downloadButton(ns("download_csv"), "Download CSV", icon = icon("download")),
+        p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
+      ),
+      plotlyOutput(ns("chart"), height = "100%"),
+      uiOutput(ns("variable_definition"))
+    )
+  )
+}
+
+ranking_tab_server <- function(id, raw_data) {
+  moduleServer(id, function(input, output, session) {
+
+    # Same DEFAULT_*-fallback sync pattern as the Trends tab -- Variable and
+    # Geography are always-active single selections here too, never blank.
+    observe({
+      df <- raw_data()
+
+      variable_choices <- series_choices(df, "Variable", VARIABLE_ORDER)
+      new_variable <- if (is.null(input$variable) || !(input$variable %in% variable_choices)) {
+        DEFAULT_VARIABLE
+      } else {
+        input$variable
+      }
+      updateSelectInput(session, "variable", choices = variable_choices, selected = new_variable)
+
+      geo_choices <- series_choices(df, "Geography", GEOGRAPHY_ORDER)
+      new_geo <- if (is.null(input$geography) || !(input$geography %in% geo_choices)) {
+        DEFAULT_GEOGRAPHY
+      } else {
+        input$geography
+      }
+      updateSelectInput(session, "geography", choices = geo_choices, selected = new_geo)
+
+      year_min <- min(df$Year)
+      year_max <- max(df$Year)
+      current_range <- input$year_range
+      range_value <- if (is.null(current_range)) {
+        c(year_min, year_max)
+      } else {
+        c(max(current_range[1], year_min), min(current_range[2], year_max))
+      }
+      updateSliderInput(session, "year_range", min = year_min, max = year_max, value = range_value)
+    }) |> bindEvent(raw_data(), once = FALSE)
+
+    scoped_raw <- reactive({
+      req(input$variable, input$geography, input$industry_level)
+      raw_data() %>%
+        filter(
+          Variable == input$variable, Geography == input$geography,
+          IndustryLevel %in% industry_levels_upto(input$industry_level)
+        )
+    })
+
+    variable_uom <- reactive({
+      vals <- raw_data() %>% filter(Variable == input$variable) %>% pull(UOM)
+      vals[1]
+    })
+
+    # CAGR from the start to the end of the selected time frame.
+    ranking_data <- reactive({
+      df <- scoped_raw()
+      validate(need(nrow(df) > 0, "No data for this variable/geography combination."))
+      rng <- req(input$year_range)
+      start_year <- rng[1]
+      end_year <- rng[2]
+      validate(need(end_year > start_year, "Select a time frame spanning at least two years to compute CAGR."))
+
+      start_df <- df %>% filter(Year == start_year) %>% select(Industry, StartValue = Value)
+      end_df <- df %>% filter(Year == end_year) %>% select(Industry, EndValue = Value)
+      joined <- inner_join(start_df, end_df, by = "Industry")
+      joined$CAGR <- (joined$EndValue / joined$StartValue)^(1 / (end_year - start_year)) - 1
+      joined
+    })
+
+    # A custom time frame can land on years some industries lack data for
+    # (added/discontinued series) -- inner_join() above silently drops them,
+    # so surface which ones instead of just shrinking the chart unexplained.
+    ranking_dropped_industries <- reactive({
+      rd <- tryCatch(ranking_data(), error = function(e) NULL)
+      if (is.null(rd)) character(0) else setdiff(unique(scoped_raw()$Industry), rd$Industry)
+    })
+
+    observeEvent(ranking_dropped_industries(), {
+      dropped <- ranking_dropped_industries()
+      if (length(dropped) > 0) {
+        showNotification(
+          paste0(
+            "Missing start/end-year data for: ", paste(dropped, collapse = ", "),
+            " -- excluded from the ranking."
+          ),
+          type = "warning"
+        )
+      }
+    })
+
+    output$chart <- renderPlotly({
+      rd <- ranking_data() %>% arrange(CAGR)
+      req(nrow(rd) > 0)
+      rd$Industry <- factor(rd$Industry, levels = rd$Industry)
+
+      # Same ranked CAGR data either way -- scatter (one point per industry,
+      # no bar length) reads better once the 3-digit level pulls in 100+
+      # industries and overlapping bars get visually noisy; bar is the more
+      # familiar shape for a shorter (e.g. Aggregate-level) list.
+      p <- if (identical(input$chart_type, "bar")) {
+        plot_ly(
+          data = rd, x = ~CAGR * 100, y = ~Industry,
+          type = "bar", orientation = "h",
+          marker = list(color = CATEGORICAL_PALETTE[1]),
+          hovertemplate = "%{y}: %{x:.2f}%<extra></extra>"
+        )
+      } else {
+        plot_ly(
+          data = rd, x = ~CAGR * 100, y = ~Industry,
+          type = "scatter", mode = "markers",
+          marker = list(color = CATEGORICAL_PALETTE[1], size = 9),
+          hovertemplate = "%{y}: %{x:.2f}%<extra></extra>"
+        )
+      }
+
+      p %>% layout(
+        title = paste0(
+          input$variable, " by industry — ", input$geography,
+          " (", input$year_range[1], "-", input$year_range[2], ")"
+        ),
+        xaxis = list(title = "Compound annual growth rate (%)", gridcolor = GRIDLINE, color = INK_MUTED),
+        yaxis = list(title = "", gridcolor = GRIDLINE, color = INK_MUTED),
+        paper_bgcolor = CHART_SURFACE, plot_bgcolor = CHART_SURFACE,
+        font = list(color = INK_PRIMARY, family = FONT_FAMILY)
+      )
+    })
+
+    output$variable_definition <- renderUI({
+      def <- VARIABLE_DEFINITIONS[[input$variable]]
+      if (is.null(def) || !nzchar(def)) return(NULL)
+      p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
+    })
+
+    output$download_csv <- downloadHandler(
+      filename = function() {
+        sprintf(
+          "productivity_ranking_%s_%s_%s_%s-%s_%s.csv",
+          gsub("[^A-Za-z0-9]+", "-", input$variable),
+          gsub("[^A-Za-z0-9]+", "-", input$geography),
+          input$industry_level,
+          input$year_range[1], input$year_range[2], format(Sys.Date(), "%Y%m%d")
+        )
+      },
+      content = function(file) {
+        out <- ranking_data() %>%
+          arrange(desc(CAGR)) %>%
+          transmute(
+            Industry, Geography = input$geography, Variable = input$variable,
+            StartYear = input$year_range[1], StartValue, EndYear = input$year_range[2], EndValue,
+            `CAGR (%)` = CAGR * 100
+          )
+        write.csv(out, file, row.names = FALSE)
+      }
+    )
+  })
+}
+
 # One tab's worth of sidebar + main content, namespaced under `id` so each
-# of the 3 remaining tabs (kind = "bar" | "ranking" | "table" -- Trends now
-# has its own dedicated trend_tab_ui/trend_tab_server above) gets its own
-# fully independent Variable/Compare/Display state instead of sharing one
-# page-level sidebar. `ns = ns` on conditionalPanel is what makes the
-# condition strings below resolve against THIS tab's namespaced widgets
-# client-side, without hand-building "input['id-view_mode']" strings.
+# of the 2 remaining tabs (kind = "bar" | "table" -- Trends and Rankings now
+# have their own dedicated modules above) gets its own fully independent
+# Variable/Compare/Display state instead of sharing one page-level sidebar.
+# `ns = ns` on conditionalPanel is what makes the condition strings below
+# resolve against THIS tab's namespaced widgets client-side, without
+# hand-building "input['id-view_mode']" strings.
 tab_module_ui <- function(id, init_df, kind) {
   ns <- NS(id)
 
   main_panel <- switch(
     kind,
-    ranking = tagList(
-      radioButtons(
-        ns("ranking_chart_type"), "Chart type",
-        choices = c("Bar" = "bar", "Scatter" = "scatter"), selected = "bar", inline = TRUE
-      ),
-      plotlyOutput(ns("chart"), height = "100%")
-    ),
     table = DTOutput(ns("chart")),
     plotlyOutput(ns("chart"), height = "100%")
   )
@@ -749,9 +957,9 @@ tab_module_ui <- function(id, init_df, kind) {
   )
 }
 
-# Reactive pipeline shared by the 3 remaining tabs (kind = "bar" | "ranking"
-# | "table"), only diverging at the final render step (kind-specific
-# chart/table). Instantiated once per tab id so each tab's
+# Reactive pipeline shared by the 2 remaining tabs (kind = "bar" | "table"),
+# only diverging at the final render step (kind-specific chart/table).
+# Instantiated once per tab id so each tab's
 # Variable/Compare/Display selections are fully independent -- module
 # namespacing (see tab_module_ui) is what makes multiple simultaneous
 # copies of the same widget ids possible in one page.
@@ -962,48 +1170,6 @@ tab_module_server <- function(id, raw_data, kind) {
     # color can shift by one slot if an earlier pair is removed.
     colors <- reactive(series_color_map(active_pairs()$SeriesLabel))
 
-    # Compound annual growth rate over the selected time frame, always from
-    # the raw index -- rebasing a series by a constant cancels out in a
-    # ratio, and growth mode isn't a level series with a coherent multi-year
-    # ratio at all, so neither toggle has anything to contribute here.
-    # Only wired up for the Industry rankings tab.
-    if (kind == "ranking") {
-      ranking_data <- reactive({
-        req(length(selected_series()) > 0)
-        rng <- req(input$year_range)
-        start_year <- rng[1]
-        end_year <- rng[2]
-        validate(need(end_year > start_year, "Select a time frame spanning at least two years to compute CAGR."))
-
-        df <- scoped_raw()
-        start_df <- df %>% filter(SeriesLabel %in% selected_series(), Year == start_year) %>%
-          select(SeriesLabel, StartValue = Value)
-        end_df <- df %>% filter(SeriesLabel %in% selected_series(), Year == end_year) %>%
-          select(SeriesLabel, EndValue = Value)
-        joined <- inner_join(start_df, end_df, by = "SeriesLabel")
-        joined$CAGR <- (joined$EndValue / joined$StartValue)^(1 / (end_year - start_year)) - 1
-        joined
-      })
-
-      ranking_dropped_series <- reactive({
-        rd <- tryCatch(ranking_data(), error = function(e) NULL)
-        if (is.null(rd)) character(0) else setdiff(selected_series(), rd$SeriesLabel)
-      })
-
-      observeEvent(ranking_dropped_series(), {
-        dropped <- ranking_dropped_series()
-        if (length(dropped) > 0) {
-          showNotification(
-            paste0(
-              "Missing start/end-year data for: ", paste(dropped, collapse = ", "),
-              " -- excluded from the industry ranking."
-            ),
-            type = "warning"
-          )
-        }
-      })
-    }
-
     if (kind == "table") {
       output$chart <- renderDT({
         df <- build_export_df(filtered_data(), input$rebase_toggle, input$base_year)
@@ -1013,71 +1179,36 @@ tab_module_server <- function(id, raw_data, kind) {
         )
       })
     } else {
+      # kind == "bar" (the only other kind this shared module still serves)
       output$chart <- renderPlotly({
-        if (kind == "bar") {
-          df <- filtered_data() %>% filter(!is.na(DisplayValue))
-          req(nrow(df) > 0)
-          pal <- colors()
-          series <- series_choices(df, "SeriesLabel")
-          axis_title <- display_axis_title(input$view_mode, input$rebase_toggle, input$base_year, input$variable, variable_uom())
-          hover_suffix <- if (identical(input$view_mode, "growth")) "%" else ""
+        df <- filtered_data() %>% filter(!is.na(DisplayValue))
+        req(nrow(df) > 0)
+        pal <- colors()
+        series <- series_choices(df, "SeriesLabel")
+        axis_title <- display_axis_title(input$view_mode, input$rebase_toggle, input$base_year, input$variable, variable_uom())
+        hover_suffix <- if (identical(input$view_mode, "growth")) "%" else ""
 
-          p <- plot_ly()
-          for (s in series) {
-            sd <- df %>% filter(SeriesLabel == s) %>% arrange(Year)
-            if (nrow(sd) == 0) next
-            p <- p %>% add_trace(
-              data = sd, x = ~Year, y = ~DisplayValue,
-              type = "bar", name = s, legendgroup = s,
-              marker = list(color = pal[[s]]),
-              hovertemplate = paste0("%{x}<br>", s, ": %{y:.1f}", hover_suffix, "<extra></extra>")
-            )
-          }
-
-          p %>% layout(
-            title = display_chart_title(input$variable, input$year_range),
-            barmode = "group",
-            xaxis = list(title = "Year", dtick = 1, gridcolor = GRIDLINE, color = INK_MUTED),
-            yaxis = list(title = axis_title, gridcolor = GRIDLINE, color = INK_MUTED),
-            paper_bgcolor = CHART_SURFACE, plot_bgcolor = CHART_SURFACE,
-            font = list(color = INK_PRIMARY, family = FONT_FAMILY),
-            legend = list(orientation = "h", y = -0.2)
-          )
-        } else {
-          # kind == "ranking"
-          rd <- ranking_data() %>% arrange(CAGR)
-          req(nrow(rd) > 0)
-          pal <- colors()
-          rd$SeriesLabel <- factor(rd$SeriesLabel, levels = rd$SeriesLabel)
-          marker_colors <- unname(pal[as.character(rd$SeriesLabel)])
-
-          # Same ranked CAGR data either way -- bar reads as a ranking, scatter
-          # (one point per series, no bar length) reads better once there are
-          # enough series that overlapping bars get visually noisy.
-          p <- if (identical(input$ranking_chart_type, "scatter")) {
-            plot_ly(
-              data = rd, x = ~CAGR * 100, y = ~SeriesLabel,
-              type = "scatter", mode = "markers",
-              marker = list(color = marker_colors, size = 12),
-              hovertemplate = "%{y}: %{x:.2f}%<extra></extra>"
-            )
-          } else {
-            plot_ly(
-              data = rd, x = ~CAGR * 100, y = ~SeriesLabel,
-              type = "bar", orientation = "h",
-              marker = list(color = marker_colors),
-              hovertemplate = "%{y}: %{x:.2f}%<extra></extra>"
-            )
-          }
-
-          p %>% layout(
-            title = paste0("Compound annual growth rate (", input$year_range[1], "-", input$year_range[2], ")"),
-            xaxis = list(title = "Compound annual growth rate (%)", gridcolor = GRIDLINE, color = INK_MUTED),
-            yaxis = list(title = "", gridcolor = GRIDLINE, color = INK_MUTED),
-            paper_bgcolor = CHART_SURFACE, plot_bgcolor = CHART_SURFACE,
-            font = list(color = INK_PRIMARY, family = FONT_FAMILY)
+        p <- plot_ly()
+        for (s in series) {
+          sd <- df %>% filter(SeriesLabel == s) %>% arrange(Year)
+          if (nrow(sd) == 0) next
+          p <- p %>% add_trace(
+            data = sd, x = ~Year, y = ~DisplayValue,
+            type = "bar", name = s, legendgroup = s,
+            marker = list(color = pal[[s]]),
+            hovertemplate = paste0("%{x}<br>", s, ": %{y:.1f}", hover_suffix, "<extra></extra>")
           )
         }
+
+        p %>% layout(
+          title = display_chart_title(input$variable, input$year_range),
+          barmode = "group",
+          xaxis = list(title = "Year", dtick = 1, gridcolor = GRIDLINE, color = INK_MUTED),
+          yaxis = list(title = axis_title, gridcolor = GRIDLINE, color = INK_MUTED),
+          paper_bgcolor = CHART_SURFACE, plot_bgcolor = CHART_SURFACE,
+          font = list(color = INK_PRIMARY, family = FONT_FAMILY),
+          legend = list(orientation = "h", y = -0.2)
+        )
       })
     }
 
@@ -1175,7 +1306,7 @@ ui <- function(request) {
     tagQuery(
       navset_pill(
         nav_panel("Trends", trend_tab_ui("trend", init_df)),
-        nav_panel("Rankings", tab_module_ui("ranking", init_df, "ranking")),
+        nav_panel("Rankings", ranking_tab_ui("ranking", init_df)),
         nav_panel("Compare", tab_module_ui("bar", init_df, "bar")),
         nav_panel("Data", tab_module_ui("table", init_df, "table"))
       )
@@ -1187,7 +1318,7 @@ server <- function(input, output, session) {
   raw_data <- RAW_DATA_READER # single shared reactiveFileReader, not duplicated per tab
 
   trend_tab_server("trend", raw_data)
-  tab_module_server("ranking", raw_data, "ranking")
+  ranking_tab_server("ranking", raw_data)
   tab_module_server("bar", raw_data, "bar")
   tab_module_server("table", raw_data, "table")
 }
