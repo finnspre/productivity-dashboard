@@ -393,6 +393,7 @@ trend_tab_ui <- function(id, init_df) {
           ns("variable"), "Variable",
           choices = series_choices(init_df, "Variable", VARIABLE_ORDER), selected = DEFAULT_VARIABLE
         ),
+        uiOutput(ns("variable_definition")),
         selectInput(
           ns("geography"), "Geography",
           choices = series_choices(init_df, "Geography", GEOGRAPHY_ORDER), selected = DEFAULT_GEOGRAPHY,
@@ -454,11 +455,10 @@ trend_tab_ui <- function(id, init_df) {
             )
           ),
           downloadButton(ns("download_csv"), "Download CSV", icon = icon("download"))
-        ),
-        p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
+        )
       ),
       plotlyOutput(ns("chart"), height = "100%"),
-      uiOutput(ns("variable_definition"))
+      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
     )
   )
 }
@@ -668,6 +668,7 @@ ranking_tab_ui <- function(id, init_df) {
           ns("variable"), "Variable",
           choices = series_choices(init_df, "Variable", VARIABLE_ORDER), selected = DEFAULT_VARIABLE
         ),
+        uiOutput(ns("variable_definition")),
         selectInput(
           ns("geography"), "Geography",
           choices = series_choices(init_df, "Geography", GEOGRAPHY_ORDER), selected = DEFAULT_GEOGRAPHY,
@@ -684,15 +685,21 @@ ranking_tab_ui <- function(id, init_df) {
           choices = c("Aggregate" = "Aggregate", "2-digit sector" = "2-digit", "3-digit subsector" = "3-digit"),
           selected = DEFAULT_INDUSTRY_LEVEL, inline = TRUE
         ),
-        radioButtons(
-          ns("chart_type"), "Chart type",
-          choices = c("Scatter" = "scatter", "Bar" = "bar"), selected = "bar", inline = TRUE
-        ),
-        downloadButton(ns("download_csv"), "Download CSV", icon = icon("download")),
-        p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
+        # Reuses the Trends tab's .trend-more-options styling (chevron
+        # summary, no default browser triangle) -- the class name is
+        # generic despite where it was first introduced.
+        tags$details(
+          id = ns("more_options"), class = "trend-more-options",
+          tags$summary("More options"),
+          radioButtons(
+            ns("chart_type"), "Chart type",
+            choices = c("Scatter" = "scatter", "Bar" = "bar"), selected = "bar", inline = TRUE
+          ),
+          downloadButton(ns("download_csv"), "Download CSV", icon = icon("download"))
+        )
       ),
       plotlyOutput(ns("chart"), height = "100%"),
-      uiOutput(ns("variable_definition"))
+      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
     )
   )
 }
@@ -874,6 +881,7 @@ tab_module_ui <- function(id, init_df, kind) {
           ns("variable"), "Variable",
           choices = series_choices(init_df, "Variable", VARIABLE_ORDER), selected = DEFAULT_VARIABLE
         ),
+        uiOutput(ns("variable_definition")),
         tags$strong("Compare"),
         # A leading "" choice is what makes a genuinely empty starting
         # selection possible -- with no option marked selected, the browser's
@@ -948,11 +956,10 @@ tab_module_ui <- function(id, init_df, kind) {
             )
           )
         ),
-        downloadButton(ns("download_csv"), "Download CSV", icon = icon("download")),
-        p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
+        downloadButton(ns("download_csv"), "Download CSV", icon = icon("download"))
       ),
       main_panel,
-      uiOutput(ns("variable_definition"))
+      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
     )
   )
 }
@@ -1262,10 +1269,25 @@ ui <- function(request) {
     # just the selected segment highlighted. margin-bottom on the row
     # itself puts a little breathing room between the buttons and the card
     # below them.
-    tags$style(HTML(
-      "body { padding: 2rem 2.5rem; }
+    #
+    # Colors/font reuse the same named constants the charts use (see top of
+    # file) so the page chrome and the plots stay a single source of truth
+    # instead of a second set of hardcoded hex values drifting out of sync.
+    #
+    # color-scheme: light tells the browser this page is deliberately
+    # light-themed -- without it, some browsers' "auto dark mode for
+    # websites" feature (on for some users at the OS/browser level) inverts
+    # our light grey/white palette into a dark one on its own.
+    tags$style(HTML(sprintf(
+      "html { color-scheme: light; }
+       body { padding: 2rem 2.5rem; background-color: %s; font-family: %s; color: %s; }
+       .card { background-color: %s; border-radius: 1.25rem; }
        .nav-pills { margin-bottom: 1rem; }
-       .nav-pills .nav-link { border: 1px solid var(--bs-border-color, #dee2e6); border-radius: 50rem; margin: 0 0.25rem; }
+       .nav-pills .nav-link {
+         border: 1px solid var(--bs-border-color, #dee2e6); border-radius: 50rem; margin: 0 0.5rem;
+         color: %s; background-color: %s;
+       }
+       .nav-pills .nav-link.active { background-color: %s; color: %s; }
        .trend-more-options > summary { cursor: pointer; list-style: none; display: flex; align-items: center;
          gap: 0.35rem; color: var(--bs-link-color, #0d6efd); font-size: 0.9rem; margin-bottom: 0.5rem; }
        .trend-more-options > summary::-webkit-details-marker { display: none; }
@@ -1284,11 +1306,15 @@ ui <- function(request) {
           (content-sized, not growing) -- override just the one directly
           inside our now-fillable tab pane so it actually claims the space
           the layers above are now correctly offering it. */
-       .tab-pane.active > .card { flex: 1 1 auto; min-height: 0; }"
-    )),
+       .tab-pane.active > .card { flex: 1 1 auto; min-height: 0; }",
+      CHART_SURFACE, FONT_FAMILY, INK_PRIMARY,
+      CHART_SURFACE,
+      INK_PRIMARY, CHART_SURFACE,
+      CATEGORICAL_PALETTE[1], CHART_SURFACE
+    ))),
     p(
       class = "text-muted",
-      style = "margin-bottom: 1.25rem;",
+      style = "margin-bottom: 0.75rem;",
       "Use this data dashboard to explore labour productivity trends across Canadian industries ",
       "using Statistics Canada data. Compare industries over time, examine recent growth and ",
       "customized subperiods, rank long-run performance, and download underlying data."
