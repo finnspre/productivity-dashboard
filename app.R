@@ -432,19 +432,21 @@ trend_tab_ui <- function(id, init_df) {
           id = ns("more_options"), class = "trend-more-options",
           tags$summary("More options"),
           sliderInput(
-            ns("year_range"), "Time frame",
+            ns("year_range"), "Date range",
             min = min(init_df$Year), max = max(init_df$Year),
             value = c(min(init_df$Year), max(init_df$Year)),
             step = 1, sep = ""
           ),
           radioButtons(
-            ns("view_mode"), "Measure",
-            choices = c("Index level" = "level", "Annual growth %" = "growth"),
-            selected = "level", inline = TRUE
+            ns("view_mode"), "View values as",
+            choices = c("Level" = "level", "Annual percentage change" = "growth"),
+            # Stacked rather than inline -- "Annual percentage change" is
+            # too long to sit next to "Level" on one line in the sidebar.
+            selected = "level", inline = FALSE
           ),
           conditionalPanel(
             "input.view_mode == 'level'", ns = ns,
-            checkboxInput(ns("rebase_toggle"), "Rebase to a base year", value = FALSE),
+            checkboxInput(ns("rebase_toggle"), "Set each series to 100 in a selected year", value = FALSE),
             conditionalPanel(
               "input.view_mode == 'level' && input.rebase_toggle == true", ns = ns,
               selectInput(
@@ -675,15 +677,21 @@ ranking_tab_ui <- function(id, init_df) {
           selectize = FALSE
         ),
         sliderInput(
-          ns("year_range"), "Time frame",
+          ns("year_range"), "Date range",
           min = min(init_df$Year), max = max(init_df$Year),
           value = c(min(init_df$Year), max(init_df$Year)),
           step = 1, sep = ""
         ),
         radioButtons(
-          ns("industry_level"), "Industry detail",
-          choices = c("Aggregate" = "Aggregate", "2-digit sector" = "2-digit", "3-digit subsector" = "3-digit"),
-          selected = DEFAULT_INDUSTRY_LEVEL, inline = TRUE
+          ns("industry_level"), "Industry classification level",
+          choices = c(
+            "Economy-wide and broad aggregates" = "Aggregate",
+            "Sector level" = "2-digit",
+            "Sub-sector level" = "3-digit"
+          ),
+          # Stacked rather than inline -- the longer labels above would
+          # wrap awkwardly across a narrow sidebar as a horizontal row.
+          selected = DEFAULT_INDUSTRY_LEVEL, inline = FALSE
         ),
         # Reuses the Trends tab's .trend-more-options styling (chevron
         # summary, no default browser triangle) -- the class name is
@@ -934,19 +942,21 @@ tab_module_ui <- function(id, init_df, kind) {
         ),
         tags$strong("Display"),
         radioButtons(
-          ns("view_mode"), "Measure",
-          choices = c("Index level" = "level", "Annual growth %" = "growth"),
-          selected = "level", inline = TRUE
+          ns("view_mode"), "View values as",
+          choices = c("Level" = "level", "Annual percentage change" = "growth"),
+          # Stacked rather than inline -- "Annual percentage change" is too
+          # long to sit next to "Level" on one line in the sidebar.
+          selected = "level", inline = FALSE
         ),
         sliderInput(
-          ns("year_range"), "Time frame",
+          ns("year_range"), "Date range",
           min = min(init_df$Year), max = max(init_df$Year),
           value = c(min(init_df$Year), max(init_df$Year)),
           step = 1, sep = ""
         ),
         conditionalPanel(
           "input.view_mode == 'level'", ns = ns,
-          checkboxInput(ns("rebase_toggle"), "Rebase to a base year", value = FALSE),
+          checkboxInput(ns("rebase_toggle"), "Set each series to 100 in a selected year", value = FALSE),
           conditionalPanel(
             "input.view_mode == 'level' && input.rebase_toggle == true", ns = ns,
             sliderInput(
