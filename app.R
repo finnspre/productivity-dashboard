@@ -277,6 +277,25 @@ load_lp_data <- function(path = LP_DATA_FILE) {
   # industry name and INDUSTRY_PARENT nests it under its real parent instead
   # of it dangling, unindented, as its own oddly-named entry.
   df$Industry <- sub("\\s*==>.*$", "", df$Industry)
+
+  # INDUSTRY_PARENT is a hand-maintained lookup, not derived from this data
+  # pull -- industry_choices_tree() already fails *soft* for anything
+  # missing from it (shows up unindented at the end of the picker instead
+  # of disappearing), but that's easy to miss visually. Log it loudly too,
+  # so a future StatCan rename/addition doesn't drift silently forever.
+  unmapped <- setdiff(
+    unique(df$Industry),
+    c("All industries", "Business sector industries", "Non-business sector industries", names(INDUSTRY_PARENT))
+  )
+  if (length(unmapped) > 0) {
+    warning(
+      "load_lp_data(): ", length(unmapped), " industry name(s) not in INDUSTRY_PARENT -- ",
+      "they'll still appear in pickers (unindented, at the end) instead of nested under their ",
+      "true parent until INDUSTRY_PARENT is updated: ", paste(unmapped, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
   df
 }
 # Check lp_data.RData for modifications every 6000 seconds (10 minutes) by default
@@ -375,6 +394,84 @@ export_column_labels <- function(cols, base_year, variable, uom) {
   labels[cols]
 }
 
+# Rebases `value` to a percentage of `base_value` (100 = base year level).
+# Returns NA -- not Inf/NaN -- whenever that's undefined: a missing base
+# value, or a base value of exactly 0. A raw StatCan value of 0 genuinely
+# occurs (e.g. a granular industry with no measured activity in a small
+# province/year), and naive division would silently produce +/-Inf that
+# slips straight past every `is.na()` guard in this file (is.na(Inf) is
+# FALSE in R) and can blow out a chart's whole axis with one bad point.
+safe_index_to_100 <- function(value, base_value) {
+  ifelse(is.na(value) | is.na(base_value) | base_value == 0, NA_real_, value / base_value * 100)
+}
+
+# Compound annual growth rate from `start_value` to `end_value` over
+# `n_years`. NA (not Inf/NaN) whenever it's undefined: a missing/non-
+# positive start value (division by zero or a meaningless negative base),
+# a missing end value, or a non-positive year span. A start value of 0 is
+# the same "real StatCan zero" case safe_index_to_100() guards against --
+# an end value of 0 is left alone (a genuine, meaningful -100% CAGR).
+compute_cagr <- function(start_value, end_value, n_years) {
+  bad_start <- is.na(start_value) | is.na(n_years) | start_value <= 0 | n_years <= 0
+  ratio <- end_value / start_value
+  ifelse(bad_start | is.na(ratio), NA_real_, ratio^(1 / n_years) - 1)
+}
+
+# True if `ancestor` is `industry` itself or one of its ancestors in the
+# Industry hierarchy (see INDUSTRY_PARENT) -- used to flag when two active
+# series in the *same* geography would double-count each other for
+# additive measures (jobs, hours, compensation): "All industries" and
+# "Manufacturing" aren't independent series, one contains the other.
+industry_is_ancestor <- function(ancestor, industry) {
+  seen <- character(0)
+  current <- industry
+  repeat {
+    if (identical(current, ancestor)) return(TRUE)
+    if (current %in% seen) return(FALSE) # cycle guard; shouldn't happen
+    seen <- c(seen, current)
+    # INDUSTRY_PARENT is a plain named character vector, not a list -- `[[`
+    # errors ("subscript out of bounds") on a name it doesn't contain,
+    # instead of returning NULL. `[` returns NA instead, which every root
+    # category (e.g. "Business sector industries") hits once walked up to,
+    # since roots have no parent entry of their own.
+    parent <- unname(INDUSTRY_PARENT[current])
+    if (is.na(parent)) {
+      # INDUSTRY_PARENT only encodes the picker's *indentation* hierarchy
+      # (2-digit -> its sector, 3-digit -> its 2-digit) -- it doesn't
+      # separately encode that "Business sector industries" and "Non-
+      # business sector industries" are themselves subtotals of "All
+      # industries" (the whole-economy total), since industry_choices_tree()
+      # treats all three as parallel roots, not literally nested. Bridge
+      # that one missing edge here so ancestry checks still catch "All
+      # industries" vs. any of its components.
+      if (current %in% c("Business sector industries", "Non-business sector industries")) {
+        parent <- "All industries"
+      } else {
+        return(FALSE)
+      }
+    }
+    current <- parent
+  }
+}
+
+# Statistics Canada's own guidance notes 2020-2021 labour productivity
+# figures were skewed by pandemic-era compositional effects (disproportionate
+# job losses in lower-wage/lower-productivity roles temporarily inflated
+# aggregate averages) -- CAGR and rebasing are both endpoint-sensitive, so a
+# range touching either year deserves a visible caveat rather than a chart
+# that just looks like an ordinary trend.
+covid_caveat_ui <- function(year_range) {
+  if (is.null(year_range) || !any(seq(year_range[1], year_range[2]) %in% c(2020, 2021))) {
+    return(NULL)
+  }
+  p(
+    class = "text-muted small",
+    "Note: 2020-2021 figures were affected by pandemic-era compositional shifts (job losses ",
+    "concentrated in lower-wage roles temporarily raised aggregate productivity/compensation ",
+    "averages) -- interpret growth, CAGR, or rebased comparisons spanning these years with care."
+  )
+}
+
 # The Trends tab: a focused single-series view (one Variable + one
 # Geography + one Industry -> one line), unlike the other 3 tabs which
 # still compare multiple (Industry, Geography) pairs at once. Kept as its
@@ -460,6 +557,7 @@ trend_tab_ui <- function(id, init_df) {
         )
       ),
       plotlyOutput(ns("chart"), height = "100%"),
+      uiOutput(ns("covid_caveat")),
       p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
     )
   )
@@ -549,11 +647,15 @@ trend_tab_server <- function(id, raw_data) {
 
       if (isTRUE(input$rebase_toggle) && !is.na(base_year_num)) {
         base_row <- df %>% filter(Year == base_year_num)
-        has_base <- nrow(base_row) > 0
-        df$RebasedValue <- if (has_base) df$Value / base_row$Value[1] * 100 else NA_real_
+        base_value <- if (nrow(base_row) > 0) base_row$Value[1] else NA_real_
+        df$RebasedValue <- safe_index_to_100(df$Value, base_value)
+        # "Missing" covers both no row at the base year at all AND a base
+        # value of exactly 0 (rebasing to a 0 is undefined, not just rare --
+        # see safe_index_to_100()) -- either way there's nothing to show.
+        missing_base <- is.na(base_value) || isTRUE(base_value == 0)
       } else {
         df$RebasedValue <- NA_real_
-        has_base <- TRUE
+        missing_base <- FALSE
       }
 
       df$DisplayValue <- if (identical(input$view_mode, "growth")) {
@@ -564,7 +666,7 @@ trend_tab_server <- function(id, raw_data) {
         df$Value
       }
 
-      list(df = df, missing_base = isTRUE(input$rebase_toggle) && !has_base)
+      list(df = df, missing_base = missing_base)
     })
 
     display_data <- reactive(transform_result()$df)
@@ -626,6 +728,8 @@ trend_tab_server <- function(id, raw_data) {
       if (is.null(def) || !nzchar(def)) return(NULL)
       p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
     })
+
+    output$covid_caveat <- renderUI(covid_caveat_ui(input$year_range))
 
     output$download_csv <- downloadHandler(
       filename = function() {
@@ -707,6 +811,7 @@ ranking_tab_ui <- function(id, init_df) {
         )
       ),
       plotlyOutput(ns("chart"), height = "100%"),
+      uiOutput(ns("covid_caveat")),
       p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
     )
   )
@@ -773,16 +878,23 @@ ranking_tab_server <- function(id, raw_data) {
       start_df <- df %>% filter(Year == start_year) %>% select(Industry, StartValue = Value)
       end_df <- df %>% filter(Year == end_year) %>% select(Industry, EndValue = Value)
       joined <- inner_join(start_df, end_df, by = "Industry")
-      joined$CAGR <- (joined$EndValue / joined$StartValue)^(1 / (end_year - start_year)) - 1
+      joined$CAGR <- compute_cagr(joined$StartValue, joined$EndValue, end_year - start_year)
       joined
     })
 
     # A custom time frame can land on years some industries lack data for
-    # (added/discontinued series) -- inner_join() above silently drops them,
-    # so surface which ones instead of just shrinking the chart unexplained.
+    # (added/discontinued series) -- inner_join() above silently drops those
+    # rows entirely. Separately, an industry can have a row at *both* years
+    # but still end up with an undefined CAGR (e.g. a start value of exactly
+    # 0 -- compute_cagr() returns NA rather than Inf for that). Both cases
+    # mean "not shown", so both get surfaced the same way instead of one
+    # silently shrinking the chart with no explanation.
     ranking_dropped_industries <- reactive({
       rd <- tryCatch(ranking_data(), error = function(e) NULL)
-      if (is.null(rd)) character(0) else setdiff(unique(scoped_raw()$Industry), rd$Industry)
+      if (is.null(rd)) return(character(0))
+      all_industries <- unique(scoped_raw()$Industry)
+      shown <- rd$Industry[!is.na(rd$CAGR)]
+      setdiff(all_industries, shown)
     })
 
     observeEvent(ranking_dropped_industries(), {
@@ -799,7 +911,7 @@ ranking_tab_server <- function(id, raw_data) {
     })
 
     output$chart <- renderPlotly({
-      rd <- ranking_data() %>% arrange(CAGR)
+      rd <- ranking_data() %>% filter(!is.na(CAGR)) %>% arrange(CAGR)
       req(nrow(rd) > 0)
       rd$Industry <- factor(rd$Industry, levels = rd$Industry)
 
@@ -840,6 +952,8 @@ ranking_tab_server <- function(id, raw_data) {
       if (is.null(def) || !nzchar(def)) return(NULL)
       p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
     })
+
+    output$covid_caveat <- renderUI(covid_caveat_ui(input$year_range))
 
     output$download_csv <- downloadHandler(
       filename = function() {
@@ -940,35 +1054,53 @@ tab_module_ui <- function(id, init_df, kind) {
           class = "text-muted small",
           "Uncheck a series to remove it. Charts stay readable up to about 6 series at once."
         ),
-        tags$strong("Display"),
-        radioButtons(
-          ns("view_mode"), "View values as",
-          choices = c("Level" = "level", "Annual percentage change" = "growth"),
-          # Stacked rather than inline -- "Annual percentage change" is too
-          # long to sit next to "Level" on one line in the sidebar.
-          selected = "level", inline = FALSE
-        ),
-        sliderInput(
-          ns("year_range"), "Date range",
-          min = min(init_df$Year), max = max(init_df$Year),
-          value = c(min(init_df$Year), max(init_df$Year)),
-          step = 1, sep = ""
-        ),
-        conditionalPanel(
-          "input.view_mode == 'level'", ns = ns,
-          checkboxInput(ns("rebase_toggle"), "Set each series to 100 in a selected year", value = FALSE),
-          conditionalPanel(
-            "input.view_mode == 'level' && input.rebase_toggle == true", ns = ns,
-            sliderInput(
-              ns("base_year"), "Base year",
-              min = min(init_df$Year), max = max(init_df$Year),
-              value = min(init_df$Year), step = 1, sep = ""
+        # Reuses the Trends/Rankings tabs' .trend-more-options styling
+        # (chevron summary, no default browser triangle) -- less-frequently-
+        # touched display controls tucked away instead of always taking up
+        # sidebar space.
+        tags$details(
+          id = ns("more_options"), class = "trend-more-options",
+          tags$summary("More options"),
+          # Only the Compare tab (kind == "bar") actually renders a chart --
+          # the Data tab is a table regardless, so this choice would have
+          # nothing to act on there.
+          if (kind == "bar") {
+            radioButtons(
+              ns("chart_type"), "Chart type",
+              choices = c("Trend line" = "line", "Bar chart" = "bar"),
+              selected = "line", inline = TRUE
             )
-          )
-        ),
-        downloadButton(ns("download_csv"), "Download CSV", icon = icon("download"))
+          },
+          radioButtons(
+            ns("view_mode"), "View values as",
+            choices = c("Level" = "level", "Annual percentage change" = "growth"),
+            # Stacked rather than inline -- "Annual percentage change" is too
+            # long to sit next to "Level" on one line in the sidebar.
+            selected = "level", inline = FALSE
+          ),
+          sliderInput(
+            ns("year_range"), "Date range",
+            min = min(init_df$Year), max = max(init_df$Year),
+            value = c(min(init_df$Year), max(init_df$Year)),
+            step = 1, sep = ""
+          ),
+          conditionalPanel(
+            "input.view_mode == 'level'", ns = ns,
+            checkboxInput(ns("rebase_toggle"), "Set each series to 100 in a selected year", value = FALSE),
+            conditionalPanel(
+              "input.view_mode == 'level' && input.rebase_toggle == true", ns = ns,
+              sliderInput(
+                ns("base_year"), "Base year",
+                min = min(init_df$Year), max = max(init_df$Year),
+                value = min(init_df$Year), step = 1, sep = ""
+              )
+            )
+          ),
+          downloadButton(ns("download_csv"), "Download CSV", icon = icon("download"))
+        )
       ),
       main_panel,
+      uiOutput(ns("covid_caveat")),
       p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
     )
   )
@@ -1058,6 +1190,33 @@ tab_module_server <- function(id, raw_data, kind) {
       key <- pair_key(input$pair_industry, input$pair_geography)
       current <- active_pairs()
       if (!(key %in% current$PairKey)) {
+        # Same geography + a hierarchy relationship (parent or child, either
+        # direction) means the two series aren't independent -- one already
+        # includes the other's activity, so comparing their *levels* isn't
+        # apples-to-apples for additive measures like jobs or compensation.
+        # Informational only (not blocked): sometimes that comparison is
+        # exactly the point (e.g. showing a subsector diverging from its
+        # sector), so this just makes the overlap visible rather than
+        # silently assuming it's a mistake.
+        related <- current[
+          current$Geography == input$pair_geography &
+            mapply(
+              function(i) industry_is_ancestor(i, input$pair_industry) || industry_is_ancestor(input$pair_industry, i),
+              current$Industry
+            ),
+        ]
+        if (nrow(related) > 0) {
+          showNotification(
+            paste0(
+              "Heads up: \"", input$pair_industry, "\" overlaps with \"",
+              paste(related$Industry, collapse = "\", \""), "\" in the industry hierarchy for ",
+              input$pair_geography, " -- one contains the other, so comparing levels isn't ",
+              "apples-to-apples for additive measures like jobs or compensation."
+            ),
+            type = "message"
+          )
+        }
+
         new_row <- data.frame(
           Industry = input$pair_industry, Geography = input$pair_geography,
           SeriesLabel = pair_label(input$pair_industry, input$pair_geography),
@@ -1132,8 +1291,11 @@ tab_module_server <- function(id, raw_data, kind) {
           filter(Year == input$base_year) %>%
           select(SeriesLabel, BaseValue = Value)
         df <- df %>% left_join(base_values, by = "SeriesLabel")
-        missing <- setdiff(unique(df$SeriesLabel), base_values$SeriesLabel)
-        df$RebasedValue <- df$Value / df$BaseValue * 100
+        df$RebasedValue <- safe_index_to_100(df$Value, df$BaseValue)
+        # "Missing" covers both a series having no row at the base year at
+        # all (BaseValue NA after the join) AND a base value of exactly 0
+        # (rebasing to a 0 is undefined -- see safe_index_to_100()).
+        missing <- df %>% filter(is.na(BaseValue) | BaseValue == 0) %>% pull(SeriesLabel) %>% unique()
         df <- df %>% select(-BaseValue)
       } else {
         df$RebasedValue <- NA_real_
@@ -1204,22 +1366,33 @@ tab_module_server <- function(id, raw_data, kind) {
         series <- series_choices(df, "SeriesLabel")
         axis_title <- display_axis_title(input$view_mode, input$rebase_toggle, input$base_year, input$variable, variable_uom())
         hover_suffix <- if (identical(input$view_mode, "growth")) "%" else ""
+        is_bar <- identical(input$chart_type, "bar")
 
         p <- plot_ly()
         for (s in series) {
           sd <- df %>% filter(SeriesLabel == s) %>% arrange(Year)
           if (nrow(sd) == 0) next
-          p <- p %>% add_trace(
-            data = sd, x = ~Year, y = ~DisplayValue,
-            type = "bar", name = s, legendgroup = s,
-            marker = list(color = pal[[s]]),
-            hovertemplate = paste0("%{x}<br>", s, ": %{y:.1f}", hover_suffix, "<extra></extra>")
-          )
+          p <- if (is_bar) {
+            p %>% add_trace(
+              data = sd, x = ~Year, y = ~DisplayValue,
+              type = "bar", name = s, legendgroup = s,
+              marker = list(color = pal[[s]]),
+              hovertemplate = paste0("%{x}<br>", s, ": %{y:.1f}", hover_suffix, "<extra></extra>")
+            )
+          } else {
+            p %>% add_trace(
+              data = sd, x = ~Year, y = ~DisplayValue,
+              type = "scatter", mode = "lines+markers", name = s, legendgroup = s,
+              line = list(color = pal[[s]], width = 2),
+              marker = list(color = pal[[s]], size = 6),
+              hovertemplate = paste0("%{x}<br>", s, ": %{y:.1f}", hover_suffix, "<extra></extra>")
+            )
+          }
         }
 
         p %>% layout(
           title = display_chart_title(input$variable, input$year_range),
-          barmode = "group",
+          barmode = if (is_bar) "group" else NULL,
           xaxis = list(title = "Year", dtick = 1, gridcolor = GRIDLINE, color = INK_MUTED),
           yaxis = list(title = axis_title, gridcolor = GRIDLINE, color = INK_MUTED),
           paper_bgcolor = CHART_SURFACE, plot_bgcolor = CHART_SURFACE,
@@ -1234,6 +1407,8 @@ tab_module_server <- function(id, raw_data, kind) {
       if (is.null(def) || !nzchar(def)) return(NULL)
       p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
     })
+
+    output$covid_caveat <- renderUI(covid_caveat_ui(input$year_range))
 
     output$download_csv <- downloadHandler(
       filename = function() {
@@ -1329,6 +1504,12 @@ ui <- function(request) {
       "using Statistics Canada data. Compare industries over time, examine recent growth and ",
       "customized subperiods, rank long-run performance, and download underlying data."
     ),
+    # Provenance for whoever's looking at the numbers -- without this, two
+    # users (or the same user before/after a scheduled data refresh) could
+    # see different figures with no indication why. Reactive on raw_data()
+    # so it updates the moment RAW_DATA_READER picks up a new pipeline run,
+    # not just once at page load.
+    uiOutput("data_asof"),
     # navset_pill (button-styled tabs) + nav-justified (stretched to fill
     # the page width in equal-width segments) instead of the default
     # left-aligned, content-width nav-tabs underline style.
@@ -1352,6 +1533,18 @@ ui <- function(request) {
 
 server <- function(input, output, session) {
   raw_data <- RAW_DATA_READER # single shared reactiveFileReader, not duplicated per tab
+
+  # raw_data() is the dependency, not the value used -- reading it just
+  # ties this output to the same reactiveFileReader invalidation as every
+  # tab's data, so the "as of" date updates the moment a new pipeline run
+  # lands, without this needing its own poll loop.
+  output$data_asof <- renderUI({
+    raw_data()
+    p(
+      class = "text-muted small", style = "margin-bottom: 0.75rem;",
+      "Data last refreshed: ", format(file.mtime(LP_DATA_FILE), "%Y-%m-%d")
+    )
+  })
 
   trend_tab_server("trend", raw_data)
   ranking_tab_server("ranking", raw_data)
