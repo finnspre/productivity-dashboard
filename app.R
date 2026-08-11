@@ -7,6 +7,17 @@ library(htmltools)
 
 LP_DATA_FILE <- Sys.getenv("LP_DATA_FILE", "lp_data.RData")
 
+# Appends a ?v=<mtime> cache-buster to a www/ asset path, so editing e.g.
+# industry_tree.js takes effect on a plain reload instead of silently
+# serving a stale cached copy from before the edit (the static file's
+# *name* doesn't change, and Shiny doesn't send cache-control headers that
+# would force revalidation on every load, so without this a browser that
+# already cached the old file can hang onto it across an ordinary reload).
+versioned_asset <- function(path) {
+  mtime <- file.mtime(file.path("www", path))
+  paste0(path, "?v=", if (is.na(mtime)) "0" else as.integer(mtime))
+}
+
 # Categorical palette
 CATEGORICAL_PALETTE <- c(
   "#012F72", # Maple Leaf Blue
@@ -218,43 +229,83 @@ INDUSTRY_PARENT <- c(
   "Wood product manufacturing" = "Manufacturing"
 )
 
-# Industry choices for the compare-picker, ordered so each industry
-# immediately follows its parent (root aggregates, then their 2-digit
-# children, then each 2-digit's 3-digit children) and indented with
-# non-breaking spaces per level -- so it's visually clear which sector a
-# subsector belongs to instead of one flat alphabetical list. Values stay
-# the plain Industry name; only the displayed label is indented.
-industry_choices_tree <- function(df) {
+# Nested tree for the custom industryTreeInput widget (see
+# www/industry_tree.js for the paired Shiny.InputBinding): each node is
+# list(value=, label=, children=list(...)), built by walking INDUSTRY_PARENT
+# from the 3 root aggregates. Unlike the old flat indented-label vector this
+# replaces, the JS side gets real parent/child nesting, which is what lets
+# it render a collapsible tree and auto-expand ancestors of a search match.
+industry_tree_nodes <- function(df) {
   available <- unique(df$Industry)
-  order <- character(0)
-  labels <- character(0)
 
-  add_children <- function(parent, depth) {
-    children <- sort(available[match(available, names(INDUSTRY_PARENT), 0L) > 0 &
-                                  INDUSTRY_PARENT[available] == parent])
-    for (child in children) {
-      order <<- c(order, child)
-      labels <<- c(labels, paste0(strrep("    ", depth), child))
-      add_children(child, depth + 1)
-    }
+  children_of <- function(parent) {
+    sort(available[match(available, names(INDUSTRY_PARENT), 0L) > 0 &
+                      INDUSTRY_PARENT[available] == parent])
+  }
+  build_node <- function(name) {
+    list(value = name, label = name, children = lapply(children_of(name), build_node))
   }
 
   roots <- intersect(c("All industries", "Business sector industries", "Non-business sector industries"), available)
-  for (r in roots) {
-    order <- c(order, r)
-    labels <- c(labels, r)
-    add_children(r, 1)
-  }
+  nodes <- lapply(roots, build_node)
 
   # Anything present but not reachable from the roots above (e.g. a future
-  # industry not yet mapped in INDUSTRY_PARENT) still shows up, unindented,
-  # rather than silently disappearing from the picker.
-  leftover <- sort(setdiff(available, order))
-  order <- c(order, leftover)
-  labels <- c(labels, leftover)
-
-  setNames(order, labels)
+  # industry not yet mapped in INDUSTRY_PARENT) still shows up, as an
+  # unindented top-level leaf, rather than silently disappearing from the
+  # picker -- same "soft fail" behaviour the old flat-list version had.
+  reachable <- unlist(lapply(nodes, flatten_tree_values), use.names = FALSE)
+  leftover <- sort(setdiff(available, reachable))
+  c(nodes, lapply(leftover, function(name) list(value = name, label = name, children = list())))
 }
+
+# Recursively collects every `value` in an industry_tree_nodes() node
+# (including itself) -- used above to find industries not reachable from
+# the 3 roots.
+flatten_tree_values <- function(node) {
+  c(node$value, unlist(lapply(node$children, flatten_tree_values), use.names = FALSE))
+}
+
+# UI generator for the collapsible tree-dropdown Industry picker. Mirrors
+# selectizeInput's single-value contract: the value Shiny sees is always a
+# plain character(1) Industry name, or "" for "nothing selected" -- never
+# NULL/character(0) -- so req()/isTruthy() gating elsewhere didn't need to
+# change just because the widget underneath did. All the interactive markup
+# (toggle button, search box, expandable rows) is built client-side by
+# www/industry_tree.js from the embedded JSON below; this only emits the
+# skeleton the binding hydrates.
+industryTreeInput <- function(inputId, label = NULL, tree_data, selected = NULL,
+                               placeholder = "Search industries...", width = NULL) {
+  selected <- if (is.null(selected) || identical(selected, character(0))) "" else selected
+  div(
+    class = "form-group shiny-input-container industry-tree-input",
+    style = css(width = validateCssUnit(width)),
+    if (!is.null(label)) tags$label(class = "control-label", `for` = inputId, label),
+    tags$div(
+      id = inputId, class = "industry-tree",
+      `data-selected` = selected, `data-placeholder` = placeholder,
+      tags$script(
+        type = "application/json", class = "industry-tree-data",
+        HTML(jsonlite::toJSON(tree_data, auto_unbox = TRUE))
+      )
+    )
+  )
+}
+
+# Server-side counterpart to updateSelectizeInput() etc. for the widget
+# above -- uses the same session$sendInputMessage() plumbing every built-in
+# update*Input() uses, which Shiny dispatches generically to the bound
+# element's receiveMessage(el, data) JS method, so no bespoke
+# session$sendCustomMessage()/session$onMessage() wiring is needed on
+# either side.
+updateIndustryTreeInput <- function(session, inputId, tree_data = NULL, selected = NULL) {
+  message <- dropNulls(list(tree_data = tree_data, selected = selected))
+  session$sendInputMessage(inputId, message)
+}
+
+# Small local stand-in for shiny:::dropNulls (used internally by every
+# built-in update*Input()) -- avoids reaching into shiny's internals with
+# ::: for the sake of one two-line helper.
+dropNulls <- function(x) x[!vapply(x, is.null, logical(1))]
 
 # data_pipeline.R pulls Stats Canada table 36-10-0480-01 then shapes/
 # renames it into Year/Geography/Variable/Industry/
@@ -454,21 +505,16 @@ industry_is_ancestor <- function(ancestor, industry) {
   }
 }
 
-# Statistics Canada's own guidance notes 2020-2021 labour productivity
-# figures were skewed by pandemic-era compositional effects (disproportionate
-# job losses in lower-wage/lower-productivity roles temporarily inflated
-# aggregate averages) -- CAGR and rebasing are both endpoint-sensitive, so a
-# range touching either year deserves a visible caveat rather than a chart
-# that just looks like an ordinary trend.
-covid_caveat_ui <- function(year_range) {
-  if (is.null(year_range) || !any(seq(year_range[1], year_range[2]) %in% c(2020, 2021))) {
-    return(NULL)
-  }
+# Provenance for whoever's looking at the numbers -- without this, two users
+# (or the same user before/after a scheduled data refresh) could see
+# different figures with no indication why. Rendered per-tab (via
+# uiOutput(ns("data_asof")) + this in each tab's own renderUI) so it sits
+# directly under that tab's own "Source: ..." line rather than as a single
+# element trailing the whole tab region below the card.
+data_asof_ui <- function() {
   p(
     class = "text-muted small",
-    "Note: 2020-2021 figures were affected by pandemic-era compositional shifts (job losses ",
-    "concentrated in lower-wage roles temporarily raised aggregate productivity/compensation ",
-    "averages) -- interpret growth, CAGR, or rebased comparisons spanning these years with care."
+    "Data last refreshed: ", format(file.mtime(LP_DATA_FILE), "%Y-%m-%d")
   )
 }
 
@@ -491,34 +537,23 @@ trend_tab_ui <- function(id, init_df) {
           choices = series_choices(init_df, "Variable", VARIABLE_ORDER), selected = DEFAULT_VARIABLE
         ),
         uiOutput(ns("variable_definition")),
+        # selectize (the default) makes this a type-to-filter searchable
+        # dropdown rather than a native <select> -- worth it even with only
+        # 14 provinces/territories, for consistency with every other picker
+        # in the app.
         selectInput(
           ns("geography"), "Geography",
           choices = series_choices(init_df, "Geography", GEOGRAPHY_ORDER), selected = DEFAULT_GEOGRAPHY,
-          selectize = FALSE
+          selectize = TRUE
         ),
         # Always the full Aggregate+2-digit+3-digit tree -- no separate
-        # industry_level toggle (none of the tabs have one).
-        selectizeInput(
+        # industry_level toggle (none of the tabs have one). Collapsible
+        # tree dropdown (see www/industry_tree.js) -- closed to just the 3
+        # root aggregates by default, arrow to expand a branch, click a
+        # label to pick it.
+        industryTreeInput(
           ns("industry"), "Industry",
-          choices = industry_choices_tree(init_df), selected = DEFAULT_INDUSTRY,
-          options = list(
-            placeholder = "Search industries...",
-            # Same indentation-that-survives-wrapped-lines trick as the
-            # other tabs' Industry picker -- see their comment for why.
-            render = I("{
-              option: function(item, escape) {
-                var text = item.label, depth = 0;
-                while (text.charCodeAt(depth) === 160) depth++;
-                return '<div style=\"padding-left:' + (depth * 4) + 'px\">' +
-                  escape(text.slice(depth)) + '</div>';
-              },
-              item: function(item, escape) {
-                var text = item.label, depth = 0;
-                while (text.charCodeAt(depth) === 160) depth++;
-                return '<div>' + escape(text.slice(depth)) + '</div>';
-              }
-            }")
-          )
+          tree_data = industry_tree_nodes(init_df), selected = DEFAULT_INDUSTRY
         ),
         # A native <details> disclosure -- zero extra JS dependencies,
         # keyboard-accessible by default. Verified (headless-browser +
@@ -557,8 +592,8 @@ trend_tab_ui <- function(id, init_df) {
         )
       ),
       plotlyOutput(ns("chart"), height = "100%"),
-      uiOutput(ns("covid_caveat")),
-      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
+      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01"),
+      uiOutput(ns("data_asof"))
     )
   )
 }
@@ -591,13 +626,12 @@ trend_tab_server <- function(id, raw_data) {
       }
       updateSelectInput(session, "geography", choices = geo_choices, selected = new_geo)
 
-      industry_choices <- industry_choices_tree(df)
-      new_industry <- if (is.null(input$industry) || !(input$industry %in% industry_choices)) {
+      new_industry <- if (is.null(input$industry) || !(input$industry %in% unique(df$Industry))) {
         DEFAULT_INDUSTRY
       } else {
         input$industry
       }
-      updateSelectizeInput(session, "industry", choices = industry_choices, selected = new_industry)
+      updateIndustryTreeInput(session, "industry", tree_data = industry_tree_nodes(df), selected = new_industry)
 
       year_min <- min(df$Year)
       year_max <- max(df$Year)
@@ -729,7 +763,14 @@ trend_tab_server <- function(id, raw_data) {
       p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
     })
 
-    output$covid_caveat <- renderUI(covid_caveat_ui(input$year_range))
+    # raw_data() is the dependency, not the value used -- reading it just
+    # ties this to the same reactiveFileReader invalidation as this tab's
+    # own data, so the "as of" date updates the moment a new pipeline run
+    # lands, without this needing its own poll loop.
+    output$data_asof <- renderUI({
+      raw_data()
+      data_asof_ui()
+    })
 
     output$download_csv <- downloadHandler(
       filename = function() {
@@ -775,10 +816,14 @@ ranking_tab_ui <- function(id, init_df) {
           choices = series_choices(init_df, "Variable", VARIABLE_ORDER), selected = DEFAULT_VARIABLE
         ),
         uiOutput(ns("variable_definition")),
+        # selectize (the default) makes this a type-to-filter searchable
+        # dropdown rather than a native <select> -- worth it even with only
+        # 14 provinces/territories, for consistency with every other picker
+        # in the app.
         selectInput(
           ns("geography"), "Geography",
           choices = series_choices(init_df, "Geography", GEOGRAPHY_ORDER), selected = DEFAULT_GEOGRAPHY,
-          selectize = FALSE
+          selectize = TRUE
         ),
         sliderInput(
           ns("year_range"), "Date range",
@@ -811,8 +856,8 @@ ranking_tab_ui <- function(id, init_df) {
         )
       ),
       plotlyOutput(ns("chart"), height = "100%"),
-      uiOutput(ns("covid_caveat")),
-      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
+      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01"),
+      uiOutput(ns("data_asof"))
     )
   )
 }
@@ -953,7 +998,14 @@ ranking_tab_server <- function(id, raw_data) {
       p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
     })
 
-    output$covid_caveat <- renderUI(covid_caveat_ui(input$year_range))
+    # raw_data() is the dependency, not the value used -- reading it just
+    # ties this to the same reactiveFileReader invalidation as this tab's
+    # own data, so the "as of" date updates the moment a new pipeline run
+    # lands, without this needing its own poll loop.
+    output$data_asof <- renderUI({
+      raw_data()
+      data_asof_ui()
+    })
 
     output$download_csv <- downloadHandler(
       filename = function() {
@@ -991,11 +1043,25 @@ tab_module_ui <- function(id, init_df, kind) {
 
   main_panel <- switch(
     kind,
-    table = DTOutput(ns("chart")),
+    # fill = FALSE is the actual, sanctioned way to opt a DT table out of
+    # bslib's fill-to-available-height system -- DTOutput() defaults to
+    # fill = TRUE, which is what was pinning it to a fixed pixel height via
+    # an actively-enforced resize observer (confirmed: neither CSS
+    # !important nor a JS override applied after the fact could beat it,
+    # since it just gets silently re-imposed on the next resize tick).
+    table = DTOutput(ns("chart"), fill = FALSE),
     plotlyOutput(ns("chart"), height = "100%")
   )
 
   card(
+    # Only the Data tab's card gets its own internal scrollbar (see the
+    # .tab-pane.active > .card.table-tab-card CSS override below) -- a DT
+    # table's true height (rows + its own "Showing X of Y"/pagination
+    # footer) is content-driven and routinely exceeds the fixed
+    # viewport-height budget every card is otherwise pinned to, which
+    # silently clipped the Source/Data-last-refreshed lines after the table
+    # instead of leaving them reachable by scrolling.
+    class = if (kind == "table") "table-tab-card",
     layout_sidebar(
       sidebar = sidebar(
         id = ns("sidebar"),
@@ -1005,54 +1071,41 @@ tab_module_ui <- function(id, init_df, kind) {
         ),
         uiOutput(ns("variable_definition")),
         tags$strong("Compare"),
-        # A leading "" choice is what makes a genuinely empty starting
-        # selection possible -- with no option marked selected, the browser's
-        # native <select> defaults to whichever option comes first, so an
-        # empty string has to *be* that first option for the box to open
-        # blank (showing the placeholder) instead of silently defaulting to
-        # the first real choice. The default series is still there, just
-        # already-applied under "Series to compare" via default_pair_row().
-        # Always the full Aggregate+2-digit+3-digit tree -- no industry_level
-        # toggle, matching the Trends tab.
-        selectizeInput(
+        # Collapsible tree dropdown (see www/industry_tree.js) -- closed to
+        # just the 3 root aggregates by default, arrow to expand a branch,
+        # click a label to pick it. Natively supports an empty "nothing
+        # selected" state (reported as ""), so unlike the old selectize
+        # picker this replaces, no leading blank "" choice trick is needed
+        # to make the box start empty.
+        industryTreeInput(
           ns("pair_industry"), "Industry",
-          choices = c("", industry_choices_tree(init_df)),
-          selected = character(0),
-          options = list(
-            placeholder = "Search industries...",
-            # Leading non-breaking spaces on the label only indent the first
-            # line of a wrapped option -- render as padding-left on the whole
-            # option div instead, so long industry names wrap without their
-            # second line snapping back to the left edge.
-            render = I("{
-              option: function(item, escape) {
-                var text = item.label, depth = 0;
-                while (text.charCodeAt(depth) === 160) depth++;
-                return '<div style=\"padding-left:' + (depth * 4) + 'px\">' +
-                  escape(text.slice(depth)) + '</div>';
-              },
-              item: function(item, escape) {
-                var text = item.label, depth = 0;
-                while (text.charCodeAt(depth) === 160) depth++;
-                return '<div>' + escape(text.slice(depth)) + '</div>';
-              }
-            }")
-          )
+          tree_data = industry_tree_nodes(init_df), selected = NULL
         ),
         selectizeInput(
           ns("pair_geography"), "Geography",
           choices = c("", GEOGRAPHY_ORDER), selected = character(0),
           options = list(placeholder = "Search geographies...")
         ),
-        actionButton(ns("add_pair"), "Add series", icon = icon("plus")),
-        checkboxGroupInput(
-          ns("active_pairs_keep"), "Series to compare",
-          choices = setNames(default_pair_row()$PairKey, default_pair_row()$SeriesLabel),
-          selected = default_pair_row()$PairKey
-        ),
+        # Starts disabled (both pickers are blank on load) -- the server's
+        # observe() on input$pair_industry/input$pair_geography takes over
+        # from here the moment the session connects, see tab_module_server().
+        actionButton(ns("add_pair"), "Add series", icon = icon("plus"), disabled = NA),
+        tags$strong("Series to compare"),
+        # Chip list replaces the old checkboxGroupInput -- active_pairs()
+        # drives this reactively via renderUI, so unlike the checkbox
+        # widget there's no separate "sync the widget" step needed whenever
+        # active_pairs() changes.
+        uiOutput(ns("active_pairs_chips")),
+        # Starts enabled -- active_pairs() has the default series in it on
+        # load, unlike Add series' pickers which start blank. The server's
+        # observe() on active_pairs() (see tab_module_server()) disables it
+        # once the list is actually empty, same toggleDisabled mechanism
+        # Add series uses.
+        actionButton(ns("clear_pairs"), "Clear comparisons", icon = icon("trash-can"), class = "btn-sm"),
         p(
           class = "text-muted small",
-          "Uncheck a series to remove it. Charts stay readable up to about 6 series at once."
+          "Click × on a chip to remove it, or Clear comparisons to remove them all. ",
+          "Charts stay readable up to about 6 series at once."
         ),
         # Reuses the Trends/Rankings tabs' .trend-more-options styling
         # (chevron summary, no default browser triangle) -- less-frequently-
@@ -1100,8 +1153,8 @@ tab_module_ui <- function(id, init_df, kind) {
         )
       ),
       main_panel,
-      uiOutput(ns("covid_caveat")),
-      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01")
+      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01"),
+      uiOutput(ns("data_asof"))
     )
   )
 }
@@ -1143,14 +1196,14 @@ tab_module_server <- function(id, raw_data, kind) {
       }
       updateSelectizeInput(session, "pair_geography", choices = c("", geo_choices), selected = new_geo)
 
-      industry_choices <- industry_choices_tree(df)
       current_industry <- input$pair_industry
-      new_industry <- if (is.null(current_industry) || !(current_industry %in% industry_choices)) {
-        character(0)
+      new_industry <- if (is.null(current_industry) || !nzchar(current_industry) ||
+                             !(current_industry %in% unique(df$Industry))) {
+        ""
       } else {
         current_industry
       }
-      updateSelectizeInput(session, "pair_industry", choices = c("", industry_choices), selected = new_industry)
+      updateIndustryTreeInput(session, "pair_industry", tree_data = industry_tree_nodes(df), selected = new_industry)
 
       year_min <- min(df$Year)
       year_max <- max(df$Year)
@@ -1178,12 +1231,15 @@ tab_module_server <- function(id, raw_data, kind) {
     # any industry with any geography.
     active_pairs <- reactiveVal(default_pair_row())
 
-    sync_active_pairs_widget <- function(pairs) {
-      updateCheckboxGroupInput(
-        session, "active_pairs_keep",
-        choices = setNames(pairs$PairKey, pairs$SeriesLabel), selected = pairs$PairKey
-      )
-    }
+    # "Add series" only makes sense once both pickers hold a real value --
+    # isTruthy() treats "" (pair_industry's "nothing selected" value) and
+    # character(0)/NULL (pair_geography's) the same way req() elsewhere in
+    # this module already does, so this and the req() inside the
+    # add_pair observer below always agree on what counts as "ready".
+    observe({
+      ready <- isTruthy(input$pair_industry) && isTruthy(input$pair_geography)
+      session$sendCustomMessage("toggleDisabled", list(id = session$ns("add_pair"), disabled = !ready))
+    })
 
     observeEvent(input$add_pair, {
       req(input$pair_industry, input$pair_geography)
@@ -1225,27 +1281,71 @@ tab_module_server <- function(id, raw_data, kind) {
         current <- rbind(current, new_row)
         active_pairs(current)
       }
-      sync_active_pairs_widget(active_pairs())
 
       # Clear the pickers back to their empty/placeholder state after every
-      # add -- mirrors the blank starting state (see the "" choice comment
-      # above) so adding a series always ends with a clean search box ready
+      # add -- so adding a series always ends with a clean search box ready
       # for the next pick, instead of leaving the just-added pick sitting
       # there looking like unconsumed input.
       updateSelectizeInput(session, "pair_geography", selected = character(0))
-      updateSelectizeInput(session, "pair_industry", selected = character(0))
+      updateIndustryTreeInput(session, "pair_industry", selected = "")
     })
 
-    # Unchecking a box in the checklist is how a pair gets removed. The
-    # widget is re-synced (not just active_pairs()) so the unchecked box
-    # actually disappears -- otherwise it would linger as checkable but
-    # inert, since its underlying row is gone from active_pairs().
-    observeEvent(input$active_pairs_keep, {
+    # Chip list for the active series -- reactive on active_pairs(), so
+    # unlike the old checkboxGroupInput this needs no explicit "sync the
+    # widget" push whenever active_pairs() changes.
+    output$active_pairs_chips <- renderUI({
+      pairs <- active_pairs()
+      if (nrow(pairs) == 0) {
+        return(p(class = "text-muted small", "No series selected."))
+      }
+      pal <- colors()
+      tags$div(
+        class = "pair-chip-list",
+        lapply(seq_len(nrow(pairs)), function(i) {
+          row <- pairs[i, ]
+          tags$span(
+            class = "pair-chip",
+            tags$span(class = "pair-chip-swatch", style = paste0("background-color:", pal[[row$SeriesLabel]], ";")),
+            tags$span(class = "pair-chip-label", row$SeriesLabel),
+            tags$button(
+              type = "button", class = "pair-chip-remove",
+              `aria-label` = paste("Remove", row$SeriesLabel),
+              onclick = sprintf(
+                "Shiny.setInputValue('%s', %s, {priority: 'event'})",
+                session$ns("remove_pair"), jsonlite::toJSON(row$PairKey)
+              ),
+              "×"
+            )
+          )
+        })
+      )
+    })
+
+    # Clicking a chip's × is how a pair gets removed now, replacing the old
+    # "uncheck a box" mechanism.
+    observeEvent(input$remove_pair, {
       current <- active_pairs()
-      kept <- current[current$PairKey %in% input$active_pairs_keep, ]
-      active_pairs(kept)
-      sync_active_pairs_widget(kept)
-    }, ignoreNULL = FALSE)
+      active_pairs(current[current$PairKey != input$remove_pair, ])
+    })
+
+    # "Clear comparisons" empties the list in one click instead of clicking
+    # every chip's × individually -- current[0, ] keeps the same columns
+    # (Industry/Geography/SeriesLabel/PairKey) with zero rows, which is
+    # exactly what the chip renderUI's nrow() == 0 empty-state branch and
+    # the downstream selected_series()/history_with_growth() req() gates
+    # already expect from "nothing selected".
+    observeEvent(input$clear_pairs, {
+      active_pairs(active_pairs()[0, ])
+    })
+
+    # Mirrors the add_pair readiness toggle above -- "Clear comparisons"
+    # only makes sense once there's something to clear.
+    observe({
+      session$sendCustomMessage(
+        "toggleDisabled",
+        list(id = session$ns("clear_pairs"), disabled = nrow(active_pairs()) == 0)
+      )
+    })
 
     # Adds the SeriesLabel every downstream reactive/chart keys off of, so
     # the rest of the reactive chain doesn't need to know pairs exist --
@@ -1408,7 +1508,14 @@ tab_module_server <- function(id, raw_data, kind) {
       p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
     })
 
-    output$covid_caveat <- renderUI(covid_caveat_ui(input$year_range))
+    # raw_data() is the dependency, not the value used -- reading it just
+    # ties this to the same reactiveFileReader invalidation as this tab's
+    # own data, so the "as of" date updates the moment a new pipeline run
+    # lands, without this needing its own poll loop.
+    output$data_asof <- renderUI({
+      raw_data()
+      data_asof_ui()
+    })
 
     output$download_csv <- downloadHandler(
       filename = function() {
@@ -1497,6 +1604,101 @@ ui <- function(request) {
       INK_PRIMARY, CHART_SURFACE,
       CATEGORICAL_PALETTE[1], CHART_SURFACE
     ))),
+    # A second, separate tags$style() -- sprintf() (used above and below for
+    # the color-token substitutions) refuses to run on a format string past
+    # 8192 characters, which one single CSS block spanning the whole page
+    # eventually hit. This block has no %s color tokens of its own, so it's
+    # plain HTML(), not sprintf(), and splitting it out here also keeps
+    # each remaining sprintf() call comfortably under that limit.
+    tags$style(HTML(
+      "/* page_fillable() pins the whole page to viewport height with no
+          page-level scrolling (by design, so Trends/Rankings/Compare's
+          Plotly charts fill exactly one screen) -- fine for a chart sized
+          to fill 100% of its card, but a DT table's true height (rows plus
+          its own Showing-X-of-Y/pagination footer) is content-driven and
+          routinely exceeds that fixed budget. Without this, anything past
+          the budget was silently clipped, which is what made the Source/
+          Data-last-refreshed lines after the table disappear or overlap
+          DT's own footer instead of just being scrolled to. Scoped to just
+          the Data tab's card (see class = if (kind == table) ... in
+          tab_module_ui()) -- Trends/Rankings/Compare keep the plain
+          clipped-to-viewport behavior, which is what makes their charts
+          fill height instead of pushing the page taller. */
+       .tab-pane.active > .card.table-tab-card { overflow-y: auto; }"
+    )),
+    tags$style(HTML(sprintf(
+      "/* Collapsible Industry tree dropdown (see www/industry_tree.js) --
+          toggle styled like a standard form-select (not pill-shaped, so it
+          reads as a dropdown, not another nav-pill), chevron reusing
+          .trend-more-options' rotate-on-open technique above. */
+       .industry-tree { position: relative; width: 100%%; }
+       .industry-tree-toggle {
+         width: 100%%; text-align: left; padding: 0.375rem 2.25rem 0.375rem 0.75rem;
+         /* Matched by hand to the Geography selectize box's own rendered
+            border/radius/font-size (rgb(141,149,158), 3px, 15px) rather
+            than Bootstrap's plain form-control defaults -- selectize.js
+            draws its own box style that doesn't line up with those, so
+            using the Bootstrap tokens here left this looking visibly
+            lighter-bordered and larger-text than the Geography box next
+            to it. */
+         border: 1px solid #8d959e; border-radius: 0.1875rem;
+         background-color: %s; color: %s; position: relative;
+         font-size: 15px; line-height: 22.5px;
+       }
+       /* #757575 rather than one of the app's own INK_* tokens -- it's the
+          browser's own native <input>::placeholder grey (what Geography's
+          selectize search box shows for free), matched here by hand since
+          this is a plain <span>, not a real placeholder attribute. */
+       .industry-tree-toggle-label.industry-tree-empty { color: #757575; }
+       .industry-tree-toggle::after {
+         content: '\\25B8'; position: absolute; right: 0.75rem; top: 50%%;
+         transform: translateY(-50%%) rotate(90deg); transition: transform 0.15s ease;
+       }
+       .industry-tree-toggle[aria-expanded=\"true\"]::after { transform: translateY(-50%%) rotate(-90deg); }
+       .industry-tree-panel {
+         position: absolute; z-index: 20; top: calc(100%% + 0.25rem); left: 0; width: 100%%;
+         max-height: 320px; overflow-y: auto; background: %s; border: 1px solid %s;
+         border-radius: 0.5rem; box-shadow: 0 0.5rem 1rem rgba(0,0,0,0.15);
+       }
+       .industry-tree-search {
+         position: sticky; top: 0; width: 100%%; padding: 0.4rem 0.6rem; box-sizing: border-box;
+         border: none; border-bottom: 1px solid %s; background: %s;
+       }
+       .industry-tree-search:focus { outline: none; }
+       .industry-tree-list, .industry-tree-children { list-style: none; margin: 0; padding: 0; }
+       .industry-tree-row { display: flex; align-items: center; gap: 0.35rem; padding: 0.15rem 0.5rem; }
+       .industry-tree-arrow { cursor: pointer; transition: transform 0.15s ease; color: %s; width: 1em; text-align: center; }
+       .industry-tree-row.expanded > .industry-tree-arrow { transform: rotate(90deg); }
+       .industry-tree-row.no-children > .industry-tree-arrow { visibility: hidden; }
+       .industry-tree-label { cursor: pointer; flex: 1 1 auto; padding: 0.25rem 0.4rem; border-radius: 0.25rem; }
+       .industry-tree-label:hover, .industry-tree-label:focus-visible { background: rgba(1,47,114,0.08); }
+       .industry-tree-row.selected > .industry-tree-label { background: %s; color: %s; }
+       .industry-tree-node[hidden] { display: none; }
+       /* Removable chip list for the Compare/Data 'Series to compare'
+          list -- same 50rem pill radius as .nav-pills .nav-link above, an
+          intentional visual echo. */
+       .pair-chip-list { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.5rem 0; }
+       .pair-chip {
+         display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.25rem 0.5rem 0.25rem 0.6rem;
+         border: 1px solid var(--bs-border-color, #dee2e6); border-radius: 50rem;
+         background: %s; color: %s; font-size: 0.85rem;
+       }
+       .pair-chip-swatch { width: 0.6rem; height: 0.6rem; border-radius: 50%%; flex-shrink: 0; }
+       .pair-chip-remove {
+         border: none; background: transparent; color: %s; border-radius: 50%%;
+         width: 1.1rem; height: 1.1rem; line-height: 1; cursor: pointer; padding: 0;
+       }
+       .pair-chip-remove:hover { background: rgba(0,0,0,0.08); color: %s; }",
+      CHART_SURFACE, INK_PRIMARY,
+      CHART_SURFACE, GRIDLINE,
+      GRIDLINE, CHART_SURFACE,
+      INK_MUTED,
+      CATEGORICAL_PALETTE[1], CHART_SURFACE,
+      CHART_SURFACE, INK_PRIMARY,
+      INK_MUTED, INK_PRIMARY
+    ))),
+    tags$script(src = versioned_asset("industry_tree.js")),
+    tags$script(src = versioned_asset("ui_helpers.js")),
     p(
       class = "text-muted",
       style = "margin-bottom: 0.75rem;",
@@ -1504,12 +1706,6 @@ ui <- function(request) {
       "using Statistics Canada data. Compare industries over time, examine recent growth and ",
       "customized subperiods, rank long-run performance, and download underlying data."
     ),
-    # Provenance for whoever's looking at the numbers -- without this, two
-    # users (or the same user before/after a scheduled data refresh) could
-    # see different figures with no indication why. Reactive on raw_data()
-    # so it updates the moment RAW_DATA_READER picks up a new pipeline run,
-    # not just once at page load.
-    uiOutput("data_asof"),
     # navset_pill (button-styled tabs) + nav-justified (stretched to fill
     # the page width in equal-width segments) instead of the default
     # left-aligned, content-width nav-tabs underline style.
@@ -1533,18 +1729,6 @@ ui <- function(request) {
 
 server <- function(input, output, session) {
   raw_data <- RAW_DATA_READER # single shared reactiveFileReader, not duplicated per tab
-
-  # raw_data() is the dependency, not the value used -- reading it just
-  # ties this output to the same reactiveFileReader invalidation as every
-  # tab's data, so the "as of" date updates the moment a new pipeline run
-  # lands, without this needing its own poll loop.
-  output$data_asof <- renderUI({
-    raw_data()
-    p(
-      class = "text-muted small", style = "margin-bottom: 0.75rem;",
-      "Data last refreshed: ", format(file.mtime(LP_DATA_FILE), "%Y-%m-%d")
-    )
-  })
 
   trend_tab_server("trend", raw_data)
   ranking_tab_server("ranking", raw_data)
