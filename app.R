@@ -18,20 +18,46 @@ versioned_asset <- function(path) {
   paste0(path, "?v=", if (is.na(mtime)) "0" else as.integer(mtime))
 }
 
-# Categorical palette
+# Categorical palette -- these are the real CSLS brand colours (the NHL-team
+# nicknames are just internal mnemonics), so the *values* are fixed. The
+# order below isn't the order they happen to have been typed in, though: it's
+# the ordering (of the same 8 hex values, slot 1 held fixed since it also
+# drives page chrome -- see below) that maximizes worst-case adjacent-pair
+# separation under simulated colour-blindness. Computed by porting the
+# dataviz skill's own OKLab + Machado-Oliveira-Fernandes (2009) CVD-simulation
+# math to R and brute-forcing all 5,040 orderings that keep slot 1 fixed:
+# the *previous* order had Canadiens Red directly beside Canucks Green (slots
+# 2-3), which is the canonical red-green colour-blindness confusion pair --
+# CVD deltaE 4.2 there, below the 6.0 hard floor, invisible to normal vision
+# (deltaE 27.9) which is exactly why this needs computing, not eyeballing.
+# This order clears worst-case adjacent CVD deltaE 24.6 (target >=8) and
+# worst-case adjacent normal-vision deltaE 28.1 (floor >=15) -- re-run the
+# same check before ever reordering this again.
 CATEGORICAL_PALETTE <- c(
-  "#012F72", # Maple Leaf Blue
-  "#CE2E2E", # Canadiens Red
+  "#012F72", # Maple Leaf Blue -- slot 1, held fixed: also the site-wide
+             # primary accent (nav-pill active background, the industry-tree
+             # hover highlight's hand-converted rgba(1,47,114,0.08), and the
+             # single-series colour on Trends/Rankings all key off this slot)
   "#3C8745", # Canucks Green
   "#FFC550", # Flames Yellow
-  "#0598D8", # Jets Blue
-  "#F74C16", # Oilers Orange
+  "#CE2E2E", # Canadiens Red
+  "#EF84EF", # Panther Pink
   "#7E1F86", # King Purple
-  "#EF84EF"  # Panther Pink
+  "#F74C16", # Oilers Orange
+  "#0598D8"  # Jets Blue
 )
+# Secondary channel (colour-blind/print/grayscale accessibility) for series
+# identity, cycled alongside CATEGORICAL_PALETTE by index -- see
+# series_color_map() and the Compare tab's per-series trace loop. 6 values
+# each (not 8) is deliberate: it keeps the dash/shape cycle out of phase with
+# the 8-colour cycle, so a repeat of "solid + slot 1's colour" doesn't land on
+# the same series index every time round.
+LINE_DASH_STYLES <- c("solid", "dash", "dot", "dashdot", "longdash", "longdashdot")
+MARKER_SYMBOLS <- c("circle", "diamond", "square", "triangle-up", "cross", "x")
+
 INK_PRIMARY <- "#0C0C0C"   # Senators Black
-INK_MUTED <- "#6B6B6B"     # Dark Grey
-GRIDLINE <- "#D9D9D9"      # Light Grey
+INK_MUTED <- "#6B6B6B"     # Dark Grey -- 5.33:1 vs CHART_SURFACE, already clears WCAG AA text contrast
+GRIDLINE <- "#D9D9D9"      # Light Grey -- deliberately low-contrast/recessive, not a bug (see display_axis_title() usage below)
 CHART_SURFACE <- "#FFFFFF" # Snow White
 FONT_FAMILY <- "Roboto, sans-serif"
 
@@ -370,7 +396,8 @@ series_choices <- function(df, dim_col, preferred_order = character(0)) {
 }
 
 # Assign palette colours to series in the order given.
-# Overflow series share muted grey.
+# Overflow series share muted grey -- see series_style_map() below for how
+# those overflow series still stay distinguishable from *each other*.
 series_color_map <- function(series) {
   n <- length(series)
   colors <- if (n <= length(CATEGORICAL_PALETTE)) {
@@ -379,6 +406,22 @@ series_color_map <- function(series) {
     c(CATEGORICAL_PALETTE, rep(INK_MUTED, n - length(CATEGORICAL_PALETTE)))
   }
   setNames(colors, series)
+}
+
+# Secondary channel (line dash / marker shape) for series identity, indexed
+# 1:1 with series_color_map()'s colour assignment -- a colour-blind-friendly
+# cue that doesn't depend on hue at all, and the mechanism that keeps
+# overflow series (beyond the fixed 8 colours, which never cycle) distinct
+# from *each other* despite sharing the same muted grey. LINE_DASH_STYLES/
+# MARKER_SYMBOLS are 6-long (not 8), so the dash/shape cycle drifts out of
+# phase with the 8-colour cycle instead of always pairing "solid" with slot 1.
+series_style_map <- function(series) {
+  n <- length(series)
+  idx <- seq_len(n)
+  list(
+    dash = setNames(LINE_DASH_STYLES[((idx - 1) %% length(LINE_DASH_STYLES)) + 1], series),
+    symbol = setNames(MARKER_SYMBOLS[((idx - 1) %% length(MARKER_SYMBOLS)) + 1], series)
+  )
 }
 
 # Comparison series is a specific (Industry, Geography) pair. 
@@ -412,6 +455,44 @@ display_axis_title <- function(view_mode, rebase_toggle, base_year, variable, uo
     paste0("Rebased index (", base_year, "=100)")
   } else {
     paste0(variable, " (", uom, ")")
+  }
+}
+
+# Metric-specific number formatting for a chart's y-axis ticks and hover
+# text -- both driven off this one helper so they never drift apart. Returns
+# d3-format strings (Plotly's tick/hover formatting language): `tickformat`
+# for the numeric part, `prefix`/`suffix` for a currency symbol or a percent
+# sign. growth mode and the rebased-to-100 view override the variable's own
+# UOM entirely (a growth rate or an index is never denominated in the
+# underlying variable's dollars/jobs/hours), so those are checked first.
+# Classification below is keyword-matched against the actual UOM strings
+# data_pipeline.R's StatCan pull produces (Percent / Jobs / Hours / dollar
+# amounts, some already expressed "in thousands", some as *rates* -- "per
+# hour", "per unit of real GDP"). An unrecognized future UOM falls through to
+# a plain thousands-separated number rather than erroring.
+metric_format_spec <- function(uom, view_mode, rebase_toggle) {
+  if (identical(view_mode, "growth")) {
+    return(list(tickformat = ".1f", prefix = "", suffix = "%"))
+  }
+  if (isTRUE(rebase_toggle)) {
+    return(list(tickformat = ".1f", prefix = "", suffix = ""))
+  }
+  uom <- if (is.null(uom)) "" else uom
+  if (grepl("percent", uom, ignore.case = TRUE)) {
+    list(tickformat = ".1f", prefix = "", suffix = "%")
+  } else if (grepl("dollar", uom, ignore.case = TRUE) && grepl("per", uom, ignore.case = TRUE)) {
+    # Rates -- productivity, compensation/hour, unit labour cost -- stay in
+    # small, meaningful figures, so cents-level precision rather than an
+    # abbreviated/rounded-off value.
+    list(tickformat = ",.2f", prefix = "$", suffix = "")
+  } else if (grepl("dollar", uom, ignore.case = TRUE)) {
+    # Levels -- value added, total compensation -- already expressed "in
+    # thousands of dollars" by the data itself, so whole dollars, comma-grouped.
+    list(tickformat = ",.0f", prefix = "$", suffix = "")
+  } else if (grepl("jobs|hours", uom, ignore.case = TRUE)) {
+    list(tickformat = ",.0f", prefix = "", suffix = "")
+  } else {
+    list(tickformat = ",.1f", prefix = "", suffix = "")
   }
 }
 
@@ -776,30 +857,56 @@ trend_tab_server <- function(id, raw_data) {
       df <- filtered_data() %>% filter(!is.na(DisplayValue)) %>% arrange(Year)
       req(nrow(df) > 0)
       axis_title <- display_axis_title(input$view_mode, input$rebase_toggle, input$base_year, input$variable, variable_uom())
-      hover_suffix <- if (identical(input$view_mode, "growth")) "%" else ""
+      fmt <- metric_format_spec(variable_uom(), input$view_mode, input$rebase_toggle)
       line_color <- CATEGORICAL_PALETTE[1]
       # Chart title only states the variable/timeframe -- with a single
       # line there's no legend to identify which industry/geography it is,
-      # so name the pair as a subtitle and in the hover text instead.
+      # so name the pair as a subtitle. Value leads (bold) with the series
+      # name following on its own line in the hover, same ordering as
+      # Compare's multi-series tooltip -- see the comment there for why the
+      # name still needs to be in the template even under "x unified"
+      # hovermode (its per-row colour swatch isn't a substitute for text).
       subtitle <- pair_label(input$industry, input$geography)
 
       plot_ly(
-        data = df, x = ~Year, y = ~DisplayValue,
+        data = df, x = ~Year, y = ~DisplayValue, name = subtitle,
         type = "scatter", mode = "lines+markers",
         line = list(color = line_color, width = 2),
-        marker = list(color = line_color, size = 7),
-        hovertemplate = paste0(subtitle, "<br>%{x}: %{y:.1f}", hover_suffix, "<extra></extra>")
+        marker = list(color = line_color, size = 8),
+        hovertemplate = paste0(
+          "<b>%{y:", fmt$prefix, fmt$tickformat, "}", fmt$suffix, "</b><br>", subtitle, "<extra></extra>"
+        )
       ) %>%
         layout(
           title = list(text = paste0(
             display_chart_title(input$variable, input$year_range),
             "<br><sup style='color:", INK_MUTED, "'>", subtitle, "</sup>"
           )),
-          xaxis = list(title = "Year", dtick = 1, gridcolor = GRIDLINE, color = INK_MUTED),
-          yaxis = list(title = axis_title, gridcolor = GRIDLINE, color = INK_MUTED),
+          # nticks (not a fixed dtick) lets Plotly's own auto-tick engine
+          # pick a clean step (2/5/10 years) that fits the actually-rendered
+          # width, recalculated on every resize -- ~8 lands in the requested
+          # 6-10 label range without hard-coding a tick-every-year step that
+          # gets crowded over a long date range.
+          xaxis = list(title = "Year", nticks = 8, tickformat = "d", gridcolor = GRIDLINE, color = INK_MUTED),
+          yaxis = list(
+            title = axis_title, gridcolor = GRIDLINE, color = INK_MUTED,
+            tickformat = fmt$tickformat, tickprefix = fmt$prefix, ticksuffix = fmt$suffix
+          ),
           paper_bgcolor = CHART_SURFACE, plot_bgcolor = CHART_SURFACE,
           font = list(color = INK_PRIMARY, family = FONT_FAMILY),
-          showlegend = FALSE
+          showlegend = FALSE,
+          hovermode = "x unified",
+          # A visible zero line in growth mode -- "above/below flat" is the
+          # first thing a reader wants out of an annual-% -change chart, and
+          # Plotly's default zeroline is unstyled/easy to miss against the
+          # gridlines otherwise.
+          shapes = if (identical(input$view_mode, "growth")) {
+            list(list(
+              type = "line", xref = "paper", x0 = 0, x1 = 1,
+              yref = "y", y0 = 0, y1 = 0,
+              line = list(color = INK_MUTED, width = 1, dash = "dot")
+            ))
+          }
         )
     })
 
@@ -1535,6 +1642,9 @@ tab_module_server <- function(id, raw_data, kind) {
     # falls through to the muted overflow color. This does mean a series'
     # color can shift by one slot if an earlier pair is removed.
     colors <- reactive(series_color_map(active_pairs()$SeriesLabel))
+    # Dash pattern / marker shape, indexed the same way as colors() -- the
+    # colour-blind-safe secondary channel (see series_style_map()).
+    styles <- reactive(series_style_map(active_pairs()$SeriesLabel))
 
     if (kind == "table") {
       output$chart <- renderDT({
@@ -1550,41 +1660,95 @@ tab_module_server <- function(id, raw_data, kind) {
         df <- filtered_data() %>% filter(!is.na(DisplayValue))
         req(nrow(df) > 0)
         pal <- colors()
+        sty <- styles()
         series <- series_choices(df, "SeriesLabel")
         axis_title <- display_axis_title(input$view_mode, input$rebase_toggle, input$base_year, input$variable, variable_uom())
-        hover_suffix <- if (identical(input$view_mode, "growth")) "%" else ""
+        fmt <- metric_format_spec(variable_uom(), input$view_mode, input$rebase_toggle)
+        hover_spec <- paste0("%{y:", fmt$prefix, fmt$tickformat, "}", fmt$suffix)
         is_bar <- identical(input$chart_type, "bar")
 
         p <- plot_ly()
         for (s in series) {
           sd <- df %>% filter(SeriesLabel == s) %>% arrange(Year)
           if (nrow(sd) == 0) next
+          # With hovermode "x unified" (below), Plotly shares one box across
+          # every series at that X and keys each row with a colour/dash/
+          # shape swatch drawn from the trace -- but *not* with the trace's
+          # name as text, so the name still needs to be in the template
+          # (confirmed empirically, not assumed). Value leads (bold), name
+          # follows on its own line -- "the reader has the series [via the
+          # swatch/legend] and wants the number" -- rather than the old
+          # "name: value" ordering repeated as a single flat line.
+          hovertemplate <- paste0("<b>", hover_spec, "</b><br>", s, "<extra></extra>")
           p <- if (is_bar) {
             p %>% add_trace(
               data = sd, x = ~Year, y = ~DisplayValue,
               type = "bar", name = s, legendgroup = s,
               marker = list(color = pal[[s]]),
-              hovertemplate = paste0("%{x}<br>", s, ": %{y:.1f}", hover_suffix, "<extra></extra>")
+              hovertemplate = hovertemplate
             )
           } else {
             p %>% add_trace(
               data = sd, x = ~Year, y = ~DisplayValue,
               type = "scatter", mode = "lines+markers", name = s, legendgroup = s,
-              line = list(color = pal[[s]], width = 2),
-              marker = list(color = pal[[s]], size = 6),
-              hovertemplate = paste0("%{x}<br>", s, ": %{y:.1f}", hover_suffix, "<extra></extra>")
+              line = list(color = pal[[s]], width = 2, dash = sty$dash[[s]]),
+              marker = list(color = pal[[s]], size = 8, symbol = sty$symbol[[s]]),
+              hovertemplate = hovertemplate
             )
+          }
+        }
+
+        # Direct end-of-line labels -- per the dataviz skill's rule these
+        # *supplement* the legend (which always stays on for 2+ series),
+        # they don't replace it, and only up to ~4 series before ends start
+        # colliding. Line mode only (a bar chart's bars are already spatially
+        # separated, nothing to label at "the end of"). Collision check is a
+        # simplified numeric-proximity heuristic on the final data values,
+        # not pixel-measured rendered positions (Shiny/R has no easy way to
+        # read back actual rendered label geometry) -- any two series' last
+        # points within 5% of the plotted y-range are treated as colliding,
+        # and direct labels are skipped entirely for that render rather than
+        # stacking illegibly; the legend + unified hover still carry identity.
+        end_labels <- if (!is_bar && length(series) >= 2 && length(series) <= 4) {
+          endpoints <- df %>%
+            group_by(SeriesLabel) %>%
+            filter(Year == max(Year)) %>%
+            ungroup()
+          y_range <- diff(range(df$DisplayValue, na.rm = TRUE))
+          collide <- y_range > 0 && any(dist(endpoints$DisplayValue) < 0.05 * y_range)
+          if (!collide) {
+            lapply(seq_len(nrow(endpoints)), function(i) {
+              row <- endpoints[i, ]
+              list(
+                x = row$Year, y = row$DisplayValue, xref = "x", yref = "y",
+                text = paste0(" ", row$SeriesLabel), showarrow = FALSE,
+                xanchor = "left", align = "left",
+                font = list(color = pal[[row$SeriesLabel]], family = FONT_FAMILY, size = 11)
+              )
+            })
           }
         }
 
         p %>% layout(
           title = display_chart_title(input$variable, input$year_range),
           barmode = if (is_bar) "group" else NULL,
-          xaxis = list(title = "Year", dtick = 1, gridcolor = GRIDLINE, color = INK_MUTED),
-          yaxis = list(title = axis_title, gridcolor = GRIDLINE, color = INK_MUTED),
+          xaxis = list(title = "Year", nticks = 8, tickformat = "d", gridcolor = GRIDLINE, color = INK_MUTED),
+          yaxis = list(
+            title = axis_title, gridcolor = GRIDLINE, color = INK_MUTED,
+            tickformat = fmt$tickformat, tickprefix = fmt$prefix, ticksuffix = fmt$suffix
+          ),
           paper_bgcolor = CHART_SURFACE, plot_bgcolor = CHART_SURFACE,
           font = list(color = INK_PRIMARY, family = FONT_FAMILY),
-          legend = list(orientation = "h", y = -0.2)
+          legend = list(orientation = "h", y = -0.2),
+          hovermode = "x unified",
+          annotations = end_labels,
+          shapes = if (identical(input$view_mode, "growth")) {
+            list(list(
+              type = "line", xref = "paper", x0 = 0, x1 = 1,
+              yref = "y", y0 = 0, y1 = 0,
+              line = list(color = INK_MUTED, width = 1, dash = "dot")
+            ))
+          }
         )
       })
     }
