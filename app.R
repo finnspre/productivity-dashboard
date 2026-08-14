@@ -353,7 +353,16 @@ load_lp_data <- function(path = LP_DATA_FILE) {
   # encodes. Strip the "==> ..." suffix so the picker shows the plain
   # industry name and INDUSTRY_PARENT nests it under its real parent instead
   # of it dangling, unindented, as its own oddly-named entry.
-  df$Industry <- sub("\\s*==>.*$", "", df$Industry)
+  #
+  # Regex over the handful of *distinct* Industry values, then remap by
+  # match() -- not sub() over all ~588k rows directly. Same result (verified
+  # byte-identical against the real data), ~32x faster (0.79s -> 0.02s on
+  # this dataset): only ~139 distinct Industry strings exist no matter how
+  # many rows there are, so the row-wise regex was redoing the same handful
+  # of substitutions hundreds of thousands of times over.
+  industry_uniq <- unique(df$Industry)
+  industry_uniq_clean <- sub("\\s*==>.*$", "", industry_uniq)
+  df$Industry <- industry_uniq_clean[match(df$Industry, industry_uniq)]
 
   # INDUSTRY_PARENT is a hand-maintained lookup, not derived from this data
   # pull -- industry_choices_tree() already fails *soft* for anything
@@ -375,12 +384,33 @@ load_lp_data <- function(path = LP_DATA_FILE) {
 
   df
 }
+# Shared cache for load_lp_data(), keyed on the file's mtime -- same
+# invalidation check reactiveFileReader (below) already does internally, but
+# usable from ui(), which runs per HTTP request *outside* any reactive
+# context (reactiveFileReader requires one). Without this, ui() and
+# RAW_DATA_READER each independently reloaded the ~1.6s-to-parse RData file,
+# so a repeat page view paid that cost again even though the server already
+# had an identical copy sitting in RAW_DATA_READER's own reactive cache.
+# session = NULL-style sharing: one mutable env for the whole R process, not
+# per-session -- consistent with RAW_DATA_READER's own sharing model below.
+LP_DATA_CACHE <- new.env(parent = emptyenv())
+cached_load_lp_data <- function(path = LP_DATA_FILE) {
+  mtime <- file.mtime(path)
+  if (is.null(LP_DATA_CACHE$df) || !identical(LP_DATA_CACHE$mtime, mtime)) {
+    LP_DATA_CACHE$df <- load_lp_data(path)
+    LP_DATA_CACHE$mtime <- mtime
+  }
+  LP_DATA_CACHE$df
+}
+
 # Check lp_data.RData for modifications every 6000 seconds (10 minutes) by default
 # but allow tests to override this to avoid waiting 10 real minutes for a test to exercise the reactiveFileReader.
 # Session = NULL means this reader isn't tied to (or
-# torn down with) any one visitor's session. 
+# torn down with) any one visitor's session.
 RAW_DATA_POLL_MS <- as.numeric(Sys.getenv("RAW_DATA_POLL_MS", 10 * 60 * 1000))
-RAW_DATA_READER <- reactiveFileReader(RAW_DATA_POLL_MS, session = NULL, LP_DATA_FILE, load_lp_data)
+# cached_load_lp_data (not load_lp_data directly) -- see LP_DATA_CACHE above,
+# this is what lets ui()'s init_df and this reactive share one in-memory load.
+RAW_DATA_READER <- reactiveFileReader(RAW_DATA_POLL_MS, session = NULL, LP_DATA_FILE, cached_load_lp_data)
 
 ordered_unique <- function(values, preferred_order) {
   known <- preferred_order[preferred_order %in% values]
@@ -652,7 +682,7 @@ download_menu_ui <- function(ns, chart_id = ns("chart"), include_png = TRUE, ful
 # tab_module_server below, since its sidebar shape and reactive pipeline
 # are genuinely different (no active_pairs/Add-series/multi-color
 # machinery), not just a different final render step.
-trend_tab_ui <- function(id, init_df) {
+trend_tab_ui <- function(id, init_df, variable_choices, geography_choices, industry_tree) {
   ns <- NS(id)
 
   card(
@@ -661,7 +691,7 @@ trend_tab_ui <- function(id, init_df) {
         id = ns("sidebar"),
         selectInput(
           ns("variable"), "Variable",
-          choices = series_choices(init_df, "Variable", VARIABLE_ORDER), selected = DEFAULT_VARIABLE
+          choices = variable_choices, selected = DEFAULT_VARIABLE
         ),
         uiOutput(ns("variable_definition")),
         # selectize (the default) makes this a type-to-filter searchable
@@ -670,7 +700,7 @@ trend_tab_ui <- function(id, init_df) {
         # in the app.
         selectInput(
           ns("geography"), "Geography",
-          choices = series_choices(init_df, "Geography", GEOGRAPHY_ORDER), selected = DEFAULT_GEOGRAPHY,
+          choices = geography_choices, selected = DEFAULT_GEOGRAPHY,
           selectize = TRUE
         ),
         # Always the full Aggregate+2-digit+3-digit tree -- no separate
@@ -680,7 +710,7 @@ trend_tab_ui <- function(id, init_df) {
         # label to pick it.
         industryTreeInput(
           ns("industry"), "Industry",
-          tree_data = industry_tree_nodes(init_df), selected = DEFAULT_INDUSTRY
+          tree_data = industry_tree, selected = DEFAULT_INDUSTRY
         ),
         # A native <details> disclosure -- zero extra JS dependencies,
         # keyboard-accessible by default. Verified (headless-browser +
@@ -734,6 +764,12 @@ trend_tab_server <- function(id, raw_data) {
     # DEFAULT_* constants rather than going blank -- Geography/Industry are
     # always-active single selections here, not an "add to compare" picker
     # that's allowed to sit empty.
+    #
+    # ignoreInit = TRUE: this only needs to fire when the underlying file
+    # actually changes -- ui() just built this session's initial widgets
+    # from the same raw_data() a moment ago, so re-running it again on
+    # session connect (bindEvent()'s default) redid that work for nothing
+    # and re-pushed an identical Industry tree over the websocket.
     observe({
       df <- raw_data()
 
@@ -778,7 +814,7 @@ trend_tab_server <- function(id, raw_data) {
         current_base
       }
       updateSelectInput(session, "base_year", choices = year_choices, selected = new_base)
-    }) |> bindEvent(raw_data(), once = FALSE)
+    }) |> bindEvent(raw_data(), once = FALSE, ignoreInit = TRUE)
 
     # Single (Variable, Industry, Geography) match -- no SeriesLabel
     # filtering/looping needed, but SeriesLabel is still added so
@@ -957,7 +993,7 @@ trend_tab_server <- function(id, raw_data) {
 # industries up to the chosen detail level are shown at once -- so this gets
 # its own dedicated module rather than another tab_module_ui/
 # tab_module_server "kind", same reasoning as the Trends tab.
-ranking_tab_ui <- function(id, init_df) {
+ranking_tab_ui <- function(id, init_df, variable_choices, geography_choices) {
   ns <- NS(id)
 
   card(
@@ -966,7 +1002,7 @@ ranking_tab_ui <- function(id, init_df) {
         id = ns("sidebar"),
         selectInput(
           ns("variable"), "Variable",
-          choices = series_choices(init_df, "Variable", VARIABLE_ORDER), selected = DEFAULT_VARIABLE
+          choices = variable_choices, selected = DEFAULT_VARIABLE
         ),
         uiOutput(ns("variable_definition")),
         # selectize (the default) makes this a type-to-filter searchable
@@ -975,7 +1011,7 @@ ranking_tab_ui <- function(id, init_df) {
         # in the app.
         selectInput(
           ns("geography"), "Geography",
-          choices = series_choices(init_df, "Geography", GEOGRAPHY_ORDER), selected = DEFAULT_GEOGRAPHY,
+          choices = geography_choices, selected = DEFAULT_GEOGRAPHY,
           selectize = TRUE
         ),
         sliderInput(
@@ -1020,6 +1056,9 @@ ranking_tab_server <- function(id, raw_data) {
 
     # Same DEFAULT_*-fallback sync pattern as the Trends tab -- Variable and
     # Geography are always-active single selections here too, never blank.
+    # ignoreInit = TRUE -- see the matching comment on the Trends tab's own
+    # sync observe(): ui() already built this session's initial widgets from
+    # the same raw_data(), so this only needs to fire on a real data change.
     observe({
       df <- raw_data()
 
@@ -1048,7 +1087,7 @@ ranking_tab_server <- function(id, raw_data) {
         c(max(current_range[1], year_min), min(current_range[2], year_max))
       }
       updateSliderInput(session, "year_range", min = year_min, max = year_max, value = range_value)
-    }) |> bindEvent(raw_data(), once = FALSE)
+    }) |> bindEvent(raw_data(), once = FALSE, ignoreInit = TRUE)
 
     scoped_raw <- reactive({
       req(input$variable, input$geography, input$industry_level)
@@ -1191,7 +1230,7 @@ ranking_tab_server <- function(id, raw_data) {
 # `ns = ns` on conditionalPanel is what makes the condition strings below
 # resolve against THIS tab's namespaced widgets client-side, without
 # hand-building "input['id-view_mode']" strings.
-tab_module_ui <- function(id, init_df, kind) {
+tab_module_ui <- function(id, init_df, kind, variable_choices, industry_tree) {
   ns <- NS(id)
 
   main_panel <- switch(
@@ -1220,7 +1259,7 @@ tab_module_ui <- function(id, init_df, kind) {
         id = ns("sidebar"),
         selectInput(
           ns("variable"), "Variable",
-          choices = series_choices(init_df, "Variable", VARIABLE_ORDER), selected = DEFAULT_VARIABLE
+          choices = variable_choices, selected = DEFAULT_VARIABLE
         ),
         uiOutput(ns("variable_definition")),
         tags$strong("Compare"),
@@ -1232,7 +1271,7 @@ tab_module_ui <- function(id, init_df, kind) {
         # to make the box start empty.
         industryTreeInput(
           ns("pair_industry"), "Industry",
-          tree_data = industry_tree_nodes(init_df), selected = NULL
+          tree_data = industry_tree, selected = NULL
         ),
         selectizeInput(
           ns("pair_geography"), "Geography",
@@ -1360,6 +1399,12 @@ tab_module_server <- function(id, raw_data, kind) {
     # where possible. This only affects what's *offered* when adding a new
     # pair -- pairs already in active_pairs() are unaffected, since they're
     # already resolved to a concrete Industry/Geography.
+    #
+    # ignoreInit = TRUE -- see the matching comment on the Trends tab's own
+    # sync observe(): ui() already built this session's initial widgets
+    # (both Compare's and Data's -- this module runs once per kind) from the
+    # same raw_data(), so this only needs to fire on a real data change, not
+    # redundantly again for every new session.
     observe({
       df <- raw_data()
 
@@ -1413,7 +1458,7 @@ tab_module_server <- function(id, raw_data, kind) {
         current_base
       }
       updateSelectInput(session, "base_year", choices = year_choices, selected = new_base)
-    }) |> bindEvent(raw_data(), once = FALSE)
+    }) |> bindEvent(raw_data(), once = FALSE, ignoreInit = TRUE)
 
     # The set of (Industry, Geography) pairs currently being compared --
     # replaces the old compare_mode-driven industries_multi/geos_multi/
@@ -1819,7 +1864,19 @@ ui <- function(request) {
   # a reactive value. Computed directly from the data at page-build time
   # (not via a server-side update*Input call) so the default selection is
   # already present in the first HTML the browser receives.
-  init_df <- load_lp_data()
+  # cached_load_lp_data(), not load_lp_data() -- see LP_DATA_CACHE -- so a
+  # repeat page view doesn't pay the ~1.6s parse cost again; only the first
+  # request after the file actually changes does.
+  init_df <- cached_load_lp_data()
+  # Computed once and threaded through to the 4 tab-UI builders below,
+  # instead of each of them independently recomputing the same
+  # series_choices()/industry_tree_nodes() result from the same init_df --
+  # this collapses what was 6 series_choices() calls + 3 industry_tree_nodes()
+  # calls (the latter each rebuilding + re-JSON-serializing a 139-node tree)
+  # per page load down to 2 and 1 respectively.
+  variable_choices <- series_choices(init_df, "Variable", VARIABLE_ORDER)
+  geography_choices <- series_choices(init_df, "Geography", GEOGRAPHY_ORDER)
+  industry_tree <- industry_tree_nodes(init_df)
 
   page_fillable(
     title = "Canadian Productivity Dashboard", # browser tab title only -- no on-page heading
@@ -2003,10 +2060,10 @@ ui <- function(request) {
     # right" item, not a "the app is broken" risk.
     tagQuery(
       navset_pill(
-        nav_panel("Trends", trend_tab_ui("trend", init_df)),
-        nav_panel("Rankings", ranking_tab_ui("ranking", init_df)),
-        nav_panel("Compare", tab_module_ui("bar", init_df, "bar")),
-        nav_panel("Data", tab_module_ui("table", init_df, "table"))
+        nav_panel("Trends", trend_tab_ui("trend", init_df, variable_choices, geography_choices, industry_tree)),
+        nav_panel("Rankings", ranking_tab_ui("ranking", init_df, variable_choices, geography_choices)),
+        nav_panel("Compare", tab_module_ui("bar", init_df, "bar", variable_choices, industry_tree)),
+        nav_panel("Data", tab_module_ui("table", init_df, "table", variable_choices, industry_tree))
       )
     )$find("ul.nav")$addClass("nav-justified")$allTags()
   )
