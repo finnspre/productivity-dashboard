@@ -16,4 +16,40 @@
     if (!el) return;
     el.disabled = !!msg.disabled;
   });
+
+  // Client-side PNG export for the Trends/Rankings/Compare tabs' Plotly
+  // charts, wired to the "Download chart as PNG" item in each tab's
+  // Download dropdown (see download_menu_ui() in app.R). Every
+  // plotlyOutput() renders straight into a <div id="<ns>-chart"> that
+  // plotly.js turns into the actual graph div, so there's nothing to
+  // render server-side here -- this just hands that already-rendered div
+  // back to Plotly's own PNG exporter. Exposed on window (rather than
+  // kept inside this IIFE's closure) since it's invoked from a plain
+  // inline onclick attribute, which only ever runs in global scope.
+  window.downloadChartPng = function (targetId) {
+    var gd = document.getElementById(targetId);
+    // Guards a chart that hasn't rendered yet (e.g. no data for the
+    // current selection) -- silently does nothing rather than throwing,
+    // same "nothing to export" outcome a disabled button would give.
+    if (!gd || typeof Plotly === "undefined" || !gd.data) return;
+
+    var titleText = (gd.layout && gd.layout.title && gd.layout.title.text) || "chart";
+    // Chart titles can carry embedded HTML (the Trends tab's
+    // "<br><sup>...</sup>" subtitle) -- strip tags down to plain text
+    // before turning it into a filename.
+    var plain = titleText.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+    var slug = plain.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    // Local calendar date, not UTC -- toISOString() reports the UTC date,
+    // which can land a day off from the CSV downloads' filenames (built
+    // server-side from Sys.Date(), the local date) for anyone west of UTC
+    // in the evening.
+    var now = new Date();
+    var pad2 = function (n) { return n < 10 ? "0" + n : "" + n; };
+    var today = now.getFullYear() + pad2(now.getMonth() + 1) + pad2(now.getDate());
+
+    Plotly.downloadImage(gd, {
+      format: "png",
+      filename: "productivity_" + (slug || "chart") + "_" + today
+    });
+  };
 })();

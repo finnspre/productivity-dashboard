@@ -518,6 +518,52 @@ data_asof_ui <- function() {
   )
 }
 
+# Shared "Download" dropdown for the Trends, Rankings, Compare, and Data
+# tabs -- replaces each tab's old single-purpose "Download CSV" button with
+# a menu tailored to what that tab can actually offer:
+#   - Trends/Rankings: chart-as-PNG + displayed data.
+#   - Compare: chart-as-PNG + displayed data (kind == "bar" -- it has a
+#     chart, but no standing notion of "the full dataset" independent of
+#     the current Variable/pairs selection).
+#   - Data: displayed data + full dataset (kind == "table" -- it renders a
+#     table, not a chart, so no PNG option; and it's the one tab already
+#     built around showing/exporting a whole scoped table, so it's the
+#     natural home for a full-dataset export too).
+#
+# The PNG option needs no server-side downloadHandler: it's wired to
+# downloadChartPng() in www/ui_helpers.js, which reaches into the already-
+# rendered Plotly graph div client-side (via Plotly's own PNG exporter) --
+# no round-trip to the server, and no server-side image rendering to keep in
+# sync with what's on screen. The CSV option(s) are real downloadHandlers,
+# same mechanism the old single button used, just re-styled as dropdown-item
+# links (downloadLink(), not downloadButton(), so they don't carry their own
+# conflicting btn styling inside the menu).
+download_menu_ui <- function(ns, chart_id = ns("chart"), include_png = TRUE, full_dataset = FALSE) {
+  tags$div(
+    class = "dropdown download-dropdown",
+    tags$button(
+      class = "btn btn-default dropdown-toggle", type = "button",
+      id = ns("download_menu_toggle"),
+      `data-bs-toggle` = "dropdown", `aria-expanded` = "false",
+      icon("download"), " Download"
+    ),
+    tags$ul(
+      class = "dropdown-menu", `aria-labelledby` = ns("download_menu_toggle"),
+      if (isTRUE(include_png)) {
+        tags$li(tags$button(
+          class = "dropdown-item", type = "button",
+          onclick = sprintf("downloadChartPng('%s')", chart_id),
+          "Download chart as PNG"
+        ))
+      },
+      tags$li(downloadLink(ns("download_csv"), "Download displayed data (.csv)", class = "dropdown-item")),
+      if (isTRUE(full_dataset)) {
+        tags$li(downloadLink(ns("download_full"), "Download full dataset (.csv)", class = "dropdown-item"))
+      }
+    )
+  )
+}
+
 # The Trends tab: a focused single-series view (one Variable + one
 # Geography + one Industry -> one line), unlike the other 3 tabs which
 # still compare multiple (Industry, Geography) pairs at once. Kept as its
@@ -588,7 +634,7 @@ trend_tab_ui <- function(id, init_df) {
               )
             )
           ),
-          downloadButton(ns("download_csv"), "Download CSV", icon = icon("download"))
+          download_menu_ui(ns)
         )
       ),
       plotlyOutput(ns("chart"), height = "100%"),
@@ -852,7 +898,7 @@ ranking_tab_ui <- function(id, init_df) {
             ns("chart_type"), "Chart type",
             choices = c("Scatter" = "scatter", "Bar" = "bar"), selected = "bar", inline = TRUE
           ),
-          downloadButton(ns("download_csv"), "Download CSV", icon = icon("download"))
+          download_menu_ui(ns)
         )
       ),
       plotlyOutput(ns("chart"), height = "100%"),
@@ -1107,50 +1153,82 @@ tab_module_ui <- function(id, init_df, kind) {
           "Click × on a chip to remove it, or Clear comparisons to remove them all. ",
           "Charts stay readable up to about 6 series at once."
         ),
-        # Reuses the Trends/Rankings tabs' .trend-more-options styling
-        # (chevron summary, no default browser triangle) -- less-frequently-
-        # touched display controls tucked away instead of always taking up
-        # sidebar space.
-        tags$details(
-          id = ns("more_options"), class = "trend-more-options",
-          tags$summary("More options"),
-          # Only the Compare tab (kind == "bar") actually renders a chart --
-          # the Data tab is a table regardless, so this choice would have
-          # nothing to act on there.
-          if (kind == "bar") {
+        if (kind == "table") {
+          # Data tab: every control sits directly in the sidebar, always
+          # visible -- no chevron disclosure (this is the one tab whose
+          # sidebar is short enough not to need one). Download sits last,
+          # after every control that shapes what it exports (Date
+          # range/rebase/base year), same trailing spot it occupies inside
+          # Compare's "More options". No "View values as" toggle -- level
+          # vs. annual-growth only ever drove the *chart's* DisplayValue
+          # (see transform_result()), which this tab's table export never
+          # reads: build_export_df() always emits both the raw Value and
+          # GrowthPct columns regardless.
+          tagList(
+            sliderInput(
+              ns("year_range"), "Date range",
+              min = min(init_df$Year), max = max(init_df$Year),
+              value = c(min(init_df$Year), max(init_df$Year)),
+              step = 1, sep = ""
+            ),
+            checkboxInput(ns("rebase_toggle"), "Set each series to 100 in a selected year", value = FALSE),
+            conditionalPanel(
+              "input.rebase_toggle == true", ns = ns,
+              # A dropdown, not a slider, matching the Trends tab's Base
+              # year picker -- a single specific year to jump to, not a
+              # range to drag across.
+              selectInput(
+                ns("base_year"), "Base year",
+                choices = sort(unique(init_df$Year)), selected = min(init_df$Year),
+                selectize = FALSE
+              )
+            ),
+            download_menu_ui(ns, include_png = FALSE, full_dataset = TRUE)
+          )
+        } else {
+          # Compare (kind == "bar"): reuses the Trends/Rankings tabs'
+          # .trend-more-options styling (chevron summary, no default
+          # browser triangle) -- less-frequently-touched display controls
+          # tucked away instead of always taking up sidebar space.
+          tags$details(
+            id = ns("more_options"), class = "trend-more-options",
+            tags$summary("More options"),
             radioButtons(
               ns("chart_type"), "Chart type",
               choices = c("Trend line" = "line", "Bar chart" = "bar"),
               selected = "line", inline = TRUE
-            )
-          },
-          radioButtons(
-            ns("view_mode"), "View values as",
-            choices = c("Level" = "level", "Annual percentage change" = "growth"),
-            # Stacked rather than inline -- "Annual percentage change" is too
-            # long to sit next to "Level" on one line in the sidebar.
-            selected = "level", inline = FALSE
-          ),
-          sliderInput(
-            ns("year_range"), "Date range",
-            min = min(init_df$Year), max = max(init_df$Year),
-            value = c(min(init_df$Year), max(init_df$Year)),
-            step = 1, sep = ""
-          ),
-          conditionalPanel(
-            "input.view_mode == 'level'", ns = ns,
-            checkboxInput(ns("rebase_toggle"), "Set each series to 100 in a selected year", value = FALSE),
+            ),
+            radioButtons(
+              ns("view_mode"), "View values as",
+              choices = c("Level" = "level", "Annual percentage change" = "growth"),
+              # Stacked rather than inline -- "Annual percentage change" is
+              # too long to sit next to "Level" on one line in the sidebar.
+              selected = "level", inline = FALSE
+            ),
+            sliderInput(
+              ns("year_range"), "Date range",
+              min = min(init_df$Year), max = max(init_df$Year),
+              value = c(min(init_df$Year), max(init_df$Year)),
+              step = 1, sep = ""
+            ),
             conditionalPanel(
-              "input.view_mode == 'level' && input.rebase_toggle == true", ns = ns,
-              sliderInput(
-                ns("base_year"), "Base year",
-                min = min(init_df$Year), max = max(init_df$Year),
-                value = min(init_df$Year), step = 1, sep = ""
+              "input.view_mode == 'level'", ns = ns,
+              checkboxInput(ns("rebase_toggle"), "Set each series to 100 in a selected year", value = FALSE),
+              conditionalPanel(
+                "input.view_mode == 'level' && input.rebase_toggle == true", ns = ns,
+                # A dropdown, not a slider, matching the Trends tab's Base
+                # year picker -- a single specific year to jump to, not a
+                # range to drag across.
+                selectInput(
+                  ns("base_year"), "Base year",
+                  choices = sort(unique(init_df$Year)), selected = min(init_df$Year),
+                  selectize = FALSE
+                )
               )
-            )
-          ),
-          downloadButton(ns("download_csv"), "Download CSV", icon = icon("download"))
-        )
+            ),
+            download_menu_ui(ns)
+          )
+        }
       ),
       main_panel,
       p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01"),
@@ -1215,14 +1293,19 @@ tab_module_server <- function(id, raw_data, kind) {
       }
       updateSliderInput(session, "year_range", min = year_min, max = year_max, value = range_value)
 
+      # base_year is a selectInput (see tab_module_ui()) -- its choices are
+      # numeric Years, but like every HTML <select> its reported value
+      # comes back as a string, hence the as.numeric() round-trip before
+      # comparing/reselecting against year_choices (a numeric vector).
+      # Same pattern trend_tab_server() uses for its own Base year picker.
       year_choices <- sort(unique(df$Year))
-      current_base <- input$base_year
-      new_base <- if (is.null(current_base) || !(current_base %in% year_choices)) {
+      current_base <- suppressWarnings(as.numeric(input$base_year))
+      new_base <- if (is.null(input$base_year) || is.na(current_base) || !(current_base %in% year_choices)) {
         min(year_choices)
       } else {
         current_base
       }
-      updateSliderInput(session, "base_year", min = year_min, max = year_max, value = new_base)
+      updateSelectInput(session, "base_year", choices = year_choices, selected = new_base)
     }) |> bindEvent(raw_data(), once = FALSE)
 
     # The set of (Industry, Geography) pairs currently being compared --
@@ -1385,10 +1468,14 @@ tab_module_server <- function(id, raw_data, kind) {
     # rebasing for lacking the chosen base year.
     transform_result <- reactive({
       df <- history_with_growth()
+      # input$base_year comes back as a string from its selectInput (see
+      # tab_module_ui()) -- coerce to numeric before comparing against the
+      # numeric Year column, same as trend_tab_server()'s transform_result().
+      base_year_num <- suppressWarnings(as.numeric(input$base_year))
 
-      if (isTRUE(input$rebase_toggle) && !is.null(input$base_year)) {
+      if (isTRUE(input$rebase_toggle) && !is.na(base_year_num)) {
         base_values <- df %>%
-          filter(Year == input$base_year) %>%
+          filter(Year == base_year_num) %>%
           select(SeriesLabel, BaseValue = Value)
         df <- df %>% left_join(base_values, by = "SeriesLabel")
         df$RebasedValue <- safe_index_to_100(df$Value, df$BaseValue)
@@ -1537,6 +1624,28 @@ tab_module_server <- function(id, raw_data, kind) {
         write.csv(df, file, row.names = FALSE)
       }
     )
+
+    # Data-only (kind == "table", see the matching `if` in tab_module_ui()):
+    # the entire underlying dataset -- every Variable/Geography/Industry/Year
+    # combination, not just the currently selected series/variable/time
+    # frame -- so this deliberately reads raw_data() directly rather than
+    # any of the scoped_raw()/filtered_data() reactives the rest of this
+    # module builds off of. No GrowthPct/RebasedValue columns here: those
+    # are relative to *this tab's* current view-mode/rebase settings, which
+    # don't have a single well-defined meaning across the whole dataset.
+    if (kind == "table") {
+      output$download_full <- downloadHandler(
+        filename = function() {
+          sprintf("productivity_full-dataset_%s.csv", format(Sys.Date(), "%Y%m%d"))
+        },
+        content = function(file) {
+          out <- raw_data() %>%
+            arrange(Variable, Geography, Industry, Year) %>%
+            select(Year, Geography, Industry, Variable, Value, UOM)
+          write.csv(out, file, row.names = FALSE)
+        }
+      )
+    }
   })
 }
 
@@ -1624,7 +1733,19 @@ ui <- function(request) {
           tab_module_ui()) -- Trends/Rankings/Compare keep the plain
           clipped-to-viewport behavior, which is what makes their charts
           fill height instead of pushing the page taller. */
-       .tab-pane.active > .card.table-tab-card { overflow-y: auto; }"
+       .tab-pane.active > .card.table-tab-card { overflow-y: auto; }
+       /* Every tab's Download dropdown (see download_menu_ui()) -- full
+          width so the toggle button lines up with the other sidebar
+          controls above it instead of sizing to its own label. */
+       .download-dropdown { width: 100%; }
+       .download-dropdown .dropdown-menu { width: 100%; }
+       /* Bootstrap's .dropdown-item defaults to white-space: nowrap, sized
+          for a normal wide dropdown -- fine there, but this menu is pinned
+          to the sidebar's own (narrow) width above, so a label like
+          'Download displayed data (.csv)' would run past the sidebar edge
+          and get clipped instead of wrapping, the way every other sidebar
+          control's label already does. */
+       .download-dropdown .dropdown-item { white-space: normal; }"
     )),
     tags$style(HTML(sprintf(
       "/* Collapsible Industry tree dropdown (see www/industry_tree.js) --
