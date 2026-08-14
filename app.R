@@ -35,16 +35,18 @@ versioned_asset <- function(path) {
 # same check before ever reordering this again.
 CATEGORICAL_PALETTE <- c(
   "#012F72", # Maple Leaf Blue -- slot 1, held fixed: also the site-wide
-             # primary accent (nav-pill active background, the industry-tree
-             # hover highlight's hand-converted rgba(1,47,114,0.08), and the
-             # single-series colour on Trends/Rankings all key off this slot)
+             # primary accent (see BRAND_MAPLE_BLUE below -- default-state
+             # buttons/links/tab text, and the single-series colour on
+             # Trends/Rankings, all key off this slot)
   "#3C8745", # Canucks Green
   "#FFC550", # Flames Yellow
   "#CE2E2E", # Canadiens Red
   "#EF84EF", # Panther Pink
   "#7E1F86", # King Purple
   "#F74C16", # Oilers Orange
-  "#0598D8"  # Jets Blue
+  "#0598D8"  # Jets Blue -- slot 8 (see BRAND_JETS_BLUE below -- csls.ca's
+             # universal hover/focus/active-state colour: active tab fill,
+             # link hover, industry-tree hover/selected highlight)
 )
 # Secondary channel (colour-blind/print/grayscale accessibility) for series
 # identity, cycled alongside CATEGORICAL_PALETTE by index -- see
@@ -55,11 +57,24 @@ CATEGORICAL_PALETTE <- c(
 LINE_DASH_STYLES <- c("solid", "dash", "dot", "dashdot", "longdash", "longdashdot")
 MARKER_SYMBOLS <- c("circle", "diamond", "square", "triangle-up", "cross", "x")
 
-INK_PRIMARY <- "#0C0C0C"   # Senators Black
-INK_MUTED <- "#6B6B6B"     # Dark Grey -- 5.33:1 vs CHART_SURFACE, already clears WCAG AA text contrast
-GRIDLINE <- "#D9D9D9"      # Light Grey -- deliberately low-contrast/recessive, not a bug (see display_axis_title() usage below)
-CHART_SURFACE <- "#FFFFFF" # Snow White
-FONT_FAMILY <- "Roboto, sans-serif"
+# Page-chrome aliases for the two brand blues csls.ca actually names in its
+# own :root (--color-maple-blue / --color-jets-blue -- see
+# CSLS-Shiny-Style-Spec.md section 2). Reused by name from CATEGORICAL_PALETTE
+# rather than re-typed as separate hex literals, so page chrome and the chart
+# palette stay pinned to one source of truth. Chrome-only: the chart code
+# below keeps referencing CATEGORICAL_PALETTE[1] directly (unchanged) for the
+# Trends/Rankings single-series colour -- these two aliases are for the CSS
+# in ui() (nav-pills, links, the industry-tree dropdown, chip list) only.
+BRAND_MAPLE_BLUE <- CATEGORICAL_PALETTE[1] # default state: buttons, links, tab/nav text
+BRAND_JETS_BLUE <- CATEGORICAL_PALETTE[8]  # hover/focus/active state: tabs, links, highlights
+
+INK_PRIMARY <- "#000000"   # csls.ca body-text black (was #0C0C0C "Senators Black" -- now the exact
+                            # site value; only this UI-chrome/axis-text neutral changed, the chart
+                            # series palette above is untouched -- see CSLS-Shiny-Style-Spec.md section 2)
+INK_MUTED <- "#6B6B6B"     # Dark Grey -- already the exact csls.ca value; 5.33:1 vs CHART_SURFACE, clears WCAG AA text contrast
+GRIDLINE <- "#D9D9D9"      # Light Grey -- already the exact csls.ca value -- deliberately low-contrast/recessive, not a bug (see display_axis_title() usage below)
+CHART_SURFACE <- "#FFFFFF" # Snow White -- already the exact csls.ca value
+FONT_FAMILY <- "Roboto, Arial, sans-serif" # matches csls.ca's --font-base fallback stack exactly
 
 DEFAULT_VARIABLE <- "Labour productivity"
 DEFAULT_GEOGRAPHY <- "Canada"
@@ -1880,6 +1895,16 @@ ui <- function(request) {
 
   page_fillable(
     title = "Canadian Productivity Dashboard", # browser tab title only -- no on-page heading
+    # Roboto -- the exact font csls.ca loads (see CSLS-Shiny-Style-Spec.md
+    # section 3) -- at the 4 weights the theme actually uses (300/400/600/
+    # 800). FONT_FAMILY's own fallback stack (Arial, sans-serif) covers the
+    # case this request is blocked, so nothing here depends on it loading.
+    tags$head(
+      tags$link(
+        rel = "stylesheet",
+        href = "https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;800&display=swap"
+      )
+    ),
     # page() renders straight into <body> with no margin/padding of its
     # own, so the intro text would otherwise butt right up against the
     # browser edge -- give the whole page some breathing room on top/sides.
@@ -1903,15 +1928,31 @@ ui <- function(request) {
     tags$style(HTML(sprintf(
       "html { color-scheme: light; }
        body { padding: 2rem 2.5rem; background-color: %s; font-family: %s; color: %s; }
-       .card { background-color: %s; border-radius: 1.25rem; }
+       /* .card's own radius/padding/background come from csls-shiny-theme.css
+          (section 8: 16px radius, 40px padding, white) -- no local override
+          needed here now that that stylesheet is loaded (see tags$head()
+          above and the trailing tags$link() below). */
        .nav-pills { margin-bottom: 1rem; }
        .nav-pills .nav-link {
-         border: 1px solid var(--bs-border-color, #dee2e6); border-radius: 50rem; margin: 0 0.5rem;
-         color: %s; background-color: %s;
+         border: .5px solid rgba(0,0,0,.24); border-radius: 999px; margin: 0 0.5rem;
+         color: %s; background-color: %s; font-weight: 400;
+         transition: background-color 280ms ease, color 280ms ease, border-color 280ms ease;
        }
-       .nav-pills .nav-link.active { background-color: %s; color: %s; }
+       /* csls.ca's interaction rule: every hover/focus state turns jets
+          blue (see CSLS-Shiny-Style-Spec.md section 2) -- applied here to
+          both the resting-tab hover and the persistent active tab, so the
+          justified pill nav reads as the same control family as the rest
+          of the page's links/buttons instead of keeping its own maple-only
+          palette. */
+       .nav-pills .nav-link:hover, .nav-pills .nav-link:focus-visible {
+         border-color: %s; color: %s; background-color: rgba(5,152,216,.1); outline: 0;
+       }
+       .nav-pills .nav-link.active, .nav-pills .nav-link.active:hover {
+         background-color: %s; color: %s; font-weight: 600; border-color: %s;
+       }
        .trend-more-options > summary { cursor: pointer; list-style: none; display: flex; align-items: center;
-         gap: 0.35rem; color: var(--bs-link-color, #0d6efd); font-size: 0.9rem; margin-bottom: 0.5rem; }
+         gap: 0.35rem; color: %s; font-size: 0.9rem; margin-bottom: 0.5rem; transition: color 280ms ease; }
+       .trend-more-options > summary:hover { color: %s; }
        .trend-more-options > summary::-webkit-details-marker { display: none; }
        .trend-more-options > summary::before { content: '\\25B8'; transition: transform 0.15s ease; }
        .trend-more-options[open] > summary::before { transform: rotate(90deg); }
@@ -1930,9 +1971,11 @@ ui <- function(request) {
           the layers above are now correctly offering it. */
        .tab-pane.active > .card { flex: 1 1 auto; min-height: 0; }",
       CHART_SURFACE, FONT_FAMILY, INK_PRIMARY,
-      CHART_SURFACE,
-      INK_PRIMARY, CHART_SURFACE,
-      CATEGORICAL_PALETTE[1], CHART_SURFACE
+      BRAND_MAPLE_BLUE, CHART_SURFACE,
+      BRAND_JETS_BLUE, BRAND_JETS_BLUE,
+      BRAND_JETS_BLUE, CHART_SURFACE, BRAND_JETS_BLUE,
+      BRAND_MAPLE_BLUE,
+      BRAND_JETS_BLUE
     ))),
     # A second, separate tags$style() -- sprintf() (used above and below for
     # the color-token substitutions) refuses to run on a format string past
@@ -1970,74 +2013,92 @@ ui <- function(request) {
     )),
     tags$style(HTML(sprintf(
       "/* Collapsible Industry tree dropdown (see www/industry_tree.js) --
-          toggle styled like a standard form-select (not pill-shaped, so it
-          reads as a dropdown, not another nav-pill), chevron reusing
-          .trend-more-options' rotate-on-open technique above. */
+          toggle styled to csls.ca's own form-control spec (42px tall, 8px
+          radius, 14px/weight-300 text, rgba(0,0,0,.24) hairline border,
+          jets blue on hover/focus -- CSLS-Shiny-Style-Spec.md section 4) so
+          it reads as the same control family as the Geography selectize
+          box next to it, not a separately hand-matched approximation of
+          it. Chevron reuses .trend-more-options' rotate-on-open technique
+          above. */
        .industry-tree { position: relative; width: 100%%; }
        .industry-tree-toggle {
-         width: 100%%; text-align: left; padding: 0.375rem 2.25rem 0.375rem 0.75rem;
-         /* Matched by hand to the Geography selectize box's own rendered
-            border/radius/font-size (rgb(141,149,158), 3px, 15px) rather
-            than Bootstrap's plain form-control defaults -- selectize.js
-            draws its own box style that doesn't line up with those, so
-            using the Bootstrap tokens here left this looking visibly
-            lighter-bordered and larger-text than the Geography box next
-            to it. */
-         border: 1px solid #8d959e; border-radius: 0.1875rem;
+         width: 100%%; height: 42px; min-height: 42px; display: flex; align-items: center;
+         text-align: left; padding: 10px 36px 10px 16px;
+         border: .5px solid rgba(0,0,0,.24); border-radius: 8px;
          background-color: %s; color: %s; position: relative;
-         font-size: 15px; line-height: 22.5px;
+         font-size: 14px; font-weight: 300; line-height: 1.4;
+         transition: border-color 280ms ease;
        }
-       /* #757575 rather than one of the app's own INK_* tokens -- it's the
-          browser's own native <input>::placeholder grey (what Geography's
-          selectize search box shows for free), matched here by hand since
-          this is a plain <span>, not a real placeholder attribute. */
-       .industry-tree-toggle-label.industry-tree-empty { color: #757575; }
+       .industry-tree-toggle:hover, .industry-tree-toggle:focus-visible,
+       .industry-tree-toggle[aria-expanded=\"true\"] { border-color: %s; outline: 0; }
+       /* Placeholder text keys off the same muted token the site's own
+          .form-control::placeholder rule uses, rather than a hand-matched
+          native-input grey -- this is a plain <span>, not a real
+          placeholder attribute, so it doesn't get that colour for free the
+          way an <input> would. */
+       .industry-tree-toggle-label.industry-tree-empty { color: %s; }
        .industry-tree-toggle::after {
-         content: '\\25B8'; position: absolute; right: 0.75rem; top: 50%%;
+         content: '\\25B8'; position: absolute; right: 16px; top: 50%%;
          transform: translateY(-50%%) rotate(90deg); transition: transform 0.15s ease;
        }
        .industry-tree-toggle[aria-expanded=\"true\"]::after { transform: translateY(-50%%) rotate(-90deg); }
        .industry-tree-panel {
          position: absolute; z-index: 20; top: calc(100%% + 0.25rem); left: 0; width: 100%%;
-         max-height: 320px; overflow-y: auto; background: %s; border: 1px solid %s;
-         border-radius: 0.5rem; box-shadow: 0 0.5rem 1rem rgba(0,0,0,0.15);
+         max-height: 320px; overflow-y: auto; background: %s; border: 0;
+         border-radius: 8px; box-shadow: 0 14px 36px rgba(0,0,0,.16);
        }
        .industry-tree-search {
-         position: sticky; top: 0; width: 100%%; padding: 0.4rem 0.6rem; box-sizing: border-box;
-         border: none; border-bottom: 1px solid %s; background: %s;
+         position: sticky; top: 0; width: 100%%; padding: 10px 16px; box-sizing: border-box;
+         border: none; border-bottom: .5px solid %s; background: %s;
+         font-size: 14px; font-weight: 300;
        }
-       .industry-tree-search:focus { outline: none; }
+       .industry-tree-search:focus { outline: 0; border-bottom-color: %s; }
        .industry-tree-list, .industry-tree-children { list-style: none; margin: 0; padding: 0; }
        .industry-tree-row { display: flex; align-items: center; gap: 0.35rem; padding: 0.15rem 0.5rem; }
        .industry-tree-arrow { cursor: pointer; transition: transform 0.15s ease; color: %s; width: 1em; text-align: center; }
        .industry-tree-row.expanded > .industry-tree-arrow { transform: rotate(90deg); }
        .industry-tree-row.no-children > .industry-tree-arrow { visibility: hidden; }
-       .industry-tree-label { cursor: pointer; flex: 1 1 auto; padding: 0.25rem 0.4rem; border-radius: 0.25rem; }
-       .industry-tree-label:hover, .industry-tree-label:focus-visible { background: rgba(1,47,114,0.08); }
-       .industry-tree-row.selected > .industry-tree-label { background: %s; color: %s; }
+       .industry-tree-label {
+         cursor: pointer; flex: 1 1 auto; padding: 10px 16px; border-radius: 4px;
+         font-size: 14px; font-weight: 300; transition: background-color 280ms ease, color 280ms ease;
+       }
+       /* Matches csls.ca's own dropdown-option treatment exactly (see
+          .selectize-dropdown .active / .option:hover in
+          csls-shiny-theme.css): a jets-blue tint background with maple-blue
+          text, not a solid fill -- for both the row being hovered and the
+          one currently selected. */
+       .industry-tree-label:hover, .industry-tree-label:focus-visible,
+       .industry-tree-row.selected > .industry-tree-label { background: rgba(5,152,216,.1); color: %s; }
        .industry-tree-node[hidden] { display: none; }
-       /* Removable chip list for the Compare/Data 'Series to compare'
-          list -- same 50rem pill radius as .nav-pills .nav-link above, an
-          intentional visual echo. */
+       /* Removable chip list for the Compare/Data 'Series to compare' list
+          -- styled like csls.ca's own selectize multi-value chips
+          (.selectize-control.multi .selectize-input > .item in
+          csls-shiny-theme.css: tint background, maple text, 4px radius)
+          rather than echoing the pill-shaped nav/button radius. */
        .pair-chip-list { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.5rem 0; }
        .pair-chip {
-         display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.25rem 0.5rem 0.25rem 0.6rem;
-         border: 1px solid var(--bs-border-color, #dee2e6); border-radius: 50rem;
-         background: %s; color: %s; font-size: 0.85rem;
+         display: inline-flex; align-items: center; gap: 0.35rem; padding: 2px 8px 2px 10px;
+         border: 0; border-radius: 4px;
+         background: rgba(5,152,216,.1); color: %s; font-size: 13px; font-weight: 400;
        }
        .pair-chip-swatch { width: 0.6rem; height: 0.6rem; border-radius: 50%%; flex-shrink: 0; }
        .pair-chip-remove {
          border: none; background: transparent; color: %s; border-radius: 50%%;
          width: 1.1rem; height: 1.1rem; line-height: 1; cursor: pointer; padding: 0;
+         transition: background-color 280ms ease, color 280ms ease;
        }
-       .pair-chip-remove:hover { background: rgba(0,0,0,0.08); color: %s; }",
+       .pair-chip-remove:hover { background: rgba(5,152,216,.1); color: %s; }",
       CHART_SURFACE, INK_PRIMARY,
-      CHART_SURFACE, GRIDLINE,
-      GRIDLINE, CHART_SURFACE,
+      BRAND_JETS_BLUE,
       INK_MUTED,
-      CATEGORICAL_PALETTE[1], CHART_SURFACE,
-      CHART_SURFACE, INK_PRIMARY,
-      INK_MUTED, INK_PRIMARY
+      CHART_SURFACE,
+      GRIDLINE, CHART_SURFACE,
+      BRAND_JETS_BLUE,
+      INK_MUTED,
+      BRAND_MAPLE_BLUE,
+      BRAND_MAPLE_BLUE,
+      INK_MUTED,
+      BRAND_JETS_BLUE
     ))),
     tags$script(src = versioned_asset("industry_tree.js")),
     tags$script(src = versioned_asset("ui_helpers.js")),
@@ -2065,7 +2126,22 @@ ui <- function(request) {
         nav_panel("Compare", tab_module_ui("bar", init_df, "bar", variable_choices, industry_tree)),
         nav_panel("Data", tab_module_ui("table", init_df, "table", variable_choices, industry_tree))
       )
-    )$find("ul.nav")$addClass("nav-justified")$allTags()
+    )$find("ul.nav")$addClass("nav-justified")$allTags(),
+    # csls-shiny-theme.css (www/) is the drop-in stylesheet that makes every
+    # Bootstrap control -- inputs, selects, checkboxes/radios, buttons, the
+    # DT table, the ionRangeSlider year picker -- match csls.ca's own
+    # metrics (42px/8px-radius controls, 24px checkboxes, pill buttons,
+    # etc.) instead of Bootstrap's defaults. Placed as the LAST tag in the
+    # whole page rather than up in tags$head() with the Google Fonts link
+    # above: a <link rel="stylesheet"> works from anywhere in the document,
+    # and putting it last in DOM order is what actually guarantees it wins
+    # the cascade over bslib's own Bootstrap bundle for same-specificity
+    # selectors (bslib injects that bundle's <link> into <head> itself, at a
+    # point in the render pipeline this file doesn't control) -- no
+    # !important needed anywhere in that stylesheet as a result. Loaded via
+    # versioned_asset() like every other www/ asset here, so an edit to it
+    # takes effect on reload instead of serving a stale cached copy.
+    tags$link(rel = "stylesheet", type = "text/css", href = versioned_asset("csls-shiny-theme.css"))
   )
 }
 
