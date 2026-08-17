@@ -21,6 +21,42 @@
       .replace(/'/g, "&#39;");
   }
 
+  // Plain-object stand-ins for Map/Set (and helpers for the DOM/NodeList
+  // methods used below) -- this widget is the *only* thing under "Industry"
+  // (industryTreeInput() emits no server-rendered fallback markup, just an
+  // empty div + the JSON payload), so if this file throws anywhere during
+  // initialize() the whole control silently stays blank with nothing else
+  // on the page indicating why. Map/Set/NodeList.prototype.forEach/
+  // Element.prototype.closest/the `:scope` combinator are all absent from
+  // older engines that some collaborators' locked-down/managed machines may
+  // still be on -- sticking to plain objects, arrays and manual loops here
+  // costs nothing on modern browsers and removes that whole failure mode.
+  function makeSet() { return Object.create(null); }
+  function setAdd(set, v) { set[v] = true; }
+  function setDelete(set, v) { delete set[v]; }
+  function setHas(set, v) { return !!set[v]; }
+  function cloneSet(set) {
+    var out = Object.create(null);
+    for (var k in set) if (Object.prototype.hasOwnProperty.call(set, k)) out[k] = true;
+    return out;
+  }
+  function forEachOwn(obj, fn) {
+    for (var k in obj) if (Object.prototype.hasOwnProperty.call(obj, k)) fn(obj[k], k);
+  }
+  function forEachNode(nodeList, fn) {
+    for (var i = 0; i < nodeList.length; i++) fn(nodeList[i]);
+  }
+  // Walks up from `el` to the nearest ancestor (or itself) carrying
+  // .industry-tree-row -- a hand-rolled Element.prototype.closest() for the
+  // one selector this file ever needs it for.
+  function closestRow(el) {
+    while (el && el.nodeType === 1) {
+      if (el.classList && el.classList.contains("industry-tree-row")) return el;
+      el = el.parentNode;
+    }
+    return null;
+  }
+
   function parseNodes(el) {
     var scriptEl = el.querySelector("script.industry-tree-data");
     if (!scriptEl) return [];
@@ -86,13 +122,19 @@
       "</div>";
     $(el).append(html);
 
-    var elementMap = new Map();
-    el.querySelectorAll(".industry-tree-node").forEach(function (li) {
-      elementMap.set(li.getAttribute("data-value"), {
+    // Plain object, not Map -- see the comment above makeSet(). Keyed by
+    // industry name; li.querySelector(".industry-tree-row") (no `:scope >`)
+    // still reliably returns *this* li's own direct row/children-list, not
+    // some deeper-nested descendant's -- the direct child is always first
+    // in document order, so querySelector's depth-first search finds it
+    // before ever descending into it.
+    var elementMap = Object.create(null);
+    forEachNode(el.querySelectorAll(".industry-tree-node"), function (li) {
+      elementMap[li.getAttribute("data-value")] = {
         li: li,
-        row: li.querySelector(":scope > .industry-tree-row"),
-        childList: li.querySelector(":scope > .industry-tree-children")
-      });
+        row: li.querySelector(".industry-tree-row"),
+        childList: li.querySelector(".industry-tree-children")
+      };
     });
 
     var toggle = el.querySelector(".industry-tree-toggle");
@@ -102,7 +144,7 @@
     var state = {
       index: index,
       elementMap: elementMap,
-      expanded: new Set(),
+      expanded: makeSet(),
       expandSnapshot: null,
       searchActive: false,
       value: "",
@@ -139,16 +181,16 @@
       state.toggleLabel.classList.add("industry-tree-empty");
     }
 
-    state.elementMap.forEach(function (refs, nodeValue) {
+    forEachOwn(state.elementMap, function (refs, nodeValue) {
       refs.row.classList.toggle("selected", nodeValue === value);
     });
   }
 
   function setExpanded(el, value, expand) {
     var state = getState(el);
-    var refs = state.elementMap.get(value);
+    var refs = state.elementMap[value];
     if (!refs || !refs.childList) return;
-    if (expand) state.expanded.add(value); else state.expanded.delete(value);
+    if (expand) setAdd(state.expanded, value); else setDelete(state.expanded, value);
     refs.childList.hidden = !expand;
     refs.row.setAttribute("aria-expanded", expand ? "true" : "false");
     refs.row.classList.toggle("expanded", expand);
@@ -191,13 +233,13 @@
 
     if (query === "") {
       if (state.searchActive) {
-        state.expanded = state.expandSnapshot || new Set();
+        state.expanded = state.expandSnapshot || makeSet();
         state.expandSnapshot = null;
         state.searchActive = false;
-        state.elementMap.forEach(function (refs, value) {
+        forEachOwn(state.elementMap, function (refs, value) {
           refs.li.hidden = false;
           if (refs.childList) {
-            var expand = state.expanded.has(value);
+            var expand = setHas(state.expanded, value);
             refs.childList.hidden = !expand;
             refs.row.setAttribute("aria-expanded", expand ? "true" : "false");
             refs.row.classList.toggle("expanded", expand);
@@ -208,25 +250,25 @@
     }
 
     if (!state.searchActive) {
-      state.expandSnapshot = new Set(state.expanded);
+      state.expandSnapshot = cloneSet(state.expanded);
       state.searchActive = true;
     }
 
-    var visible = new Set();
+    var visible = makeSet();
     Object.keys(state.index).forEach(function (value) {
       var info = state.index[value];
       if (info.label.toLowerCase().indexOf(query) === -1) return;
-      visible.add(value);
+      setAdd(visible, value);
       var parent = info.parentValue;
       while (parent) {
-        visible.add(parent);
+        setAdd(visible, parent);
         var parentInfo = state.index[parent];
         parent = parentInfo ? parentInfo.parentValue : null;
       }
     });
 
-    state.elementMap.forEach(function (refs, value) {
-      var show = visible.has(value);
+    forEachOwn(state.elementMap, function (refs, value) {
+      var show = setHas(visible, value);
       refs.li.hidden = !show;
       if (refs.childList) {
         refs.childList.hidden = !show;
@@ -264,10 +306,10 @@
 
       $(el).on("click.industryTree", ".industry-tree-arrow", function (e) {
         e.stopPropagation();
-        var row = e.currentTarget.closest(".industry-tree-row");
+        var row = closestRow(e.currentTarget);
         var value = row.getAttribute("data-value");
         var state = getState(el);
-        setExpanded(el, value, !state.expanded.has(value));
+        setExpanded(el, value, !setHas(state.expanded, value));
       });
 
       function selectRow(row) {
@@ -279,13 +321,13 @@
       }
 
       $(el).on("click.industryTree", ".industry-tree-label", function (e) {
-        selectRow(e.currentTarget.closest(".industry-tree-row"));
+        selectRow(closestRow(e.currentTarget));
       });
 
       $(el).on("keydown.industryTree", ".industry-tree-label", function (e) {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          selectRow(e.currentTarget.closest(".industry-tree-row"));
+          selectRow(closestRow(e.currentTarget));
         }
       });
 
