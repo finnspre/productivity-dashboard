@@ -104,6 +104,74 @@
     return $(el).data("treeState");
   }
 
+  // Last-resort path for the failure mode the comment above makeSet()
+  // warns about: renderTree() throws for some reason this file didn't
+  // anticipate (a still-missing DOM/engine feature, a malformed tree_data
+  // payload, whatever), and initialize()/receiveMessage() catch it before
+  // it can leave `el` permanently empty. Not as nice as the real tree +
+  // search widget, but it's a real, working single-select Industry picker
+  // built from nothing but createElement/appendChild, so it doesn't lean on
+  // any of the same DOM/engine features that might have just failed.
+  function flattenNodes(nodes, depth, out) {
+    nodes.forEach(function (node) {
+      out.push({ value: node.value, label: node.label, depth: depth });
+      if (node.children && node.children.length) {
+        flattenNodes(node.children, depth + 1, out);
+      }
+    });
+    return out;
+  }
+
+  function renderFallback(el, nodes, initialValue) {
+    $(el).find(".industry-tree-toggle, .industry-tree-panel, .industry-tree-fallback").remove();
+
+    var flat = [];
+    try {
+      flat = flattenNodes(nodes || [], 0, []);
+    } catch (e) {
+      flat = []; // still renders a usable (if empty) picker -- see below
+    }
+
+    var select = document.createElement("select");
+    select.className = "form-control industry-tree-fallback";
+
+    var placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = el.getAttribute("data-placeholder") || "Select an industry...";
+    select.appendChild(placeholder);
+
+    flat.forEach(function (item) {
+      var opt = document.createElement("option");
+      opt.value = item.value;
+      var indent = "";
+      for (var i = 0; i < item.depth; i++) indent += "— "; // em dash + hair space: cheap depth cue, no CSS needed
+      opt.textContent = indent + item.label;
+      select.appendChild(opt);
+    });
+
+    select.value = initialValue || "";
+    el.appendChild(select);
+
+    $(el).data("treeState", { fallback: true, select: select, value: select.value });
+    el.setAttribute("data-selected", select.value);
+  }
+
+  // Shared by industryTreeBinding.setValue() and receiveMessage()'s
+  // "selected"-only branch -- routes to the real tree's setValue() or,
+  // in fallback mode, just updates the <select> directly (setValue()
+  // itself assumes state.toggleLabel/elementMap etc., which don't exist
+  // once renderFallback() has run).
+  function setValueAny(el, value) {
+    var state = getState(el);
+    if (state && state.fallback) {
+      state.select.value = value || "";
+      state.value = state.select.value;
+      el.setAttribute("data-selected", state.value);
+    } else {
+      setValue(el, value);
+    }
+  }
+
   // (Re)builds the toggle button + dropdown panel from `nodes`, replacing
   // whatever was there before (used both at init and on receiveMessage()
   // with a new tree_data). The embedded <script> tag from R is left alone
@@ -285,16 +353,29 @@
     },
 
     initialize: function (el) {
-      renderTree(el, parseNodes(el), el.getAttribute("data-selected") || "");
+      var nodes = parseNodes(el);
+      var initialValue = el.getAttribute("data-selected") || "";
+      try {
+        renderTree(el, nodes, initialValue);
+      } catch (e) {
+        if (window.console && console.error) {
+          console.error(
+            "industryTreeInput (#" + (el.id || "?") + "): failed to build the tree widget, " +
+            "falling back to a plain <select>. Please report this error:", e
+          );
+        }
+        renderFallback(el, nodes, initialValue);
+      }
     },
 
     getValue: function (el) {
       var state = getState(el);
-      return (state && state.value) || "";
+      if (!state) return "";
+      return (state.fallback ? state.select.value : state.value) || "";
     },
 
     setValue: function (el, value) {
-      setValue(el, value);
+      setValueAny(el, value);
     },
 
     subscribe: function (el, callback) {
@@ -361,11 +442,22 @@
 
     receiveMessage: function (el, data) {
       var state = getState(el);
-      var priorValue = state ? state.value : (el.getAttribute("data-selected") || "");
+      var priorValue = state ? (state.fallback ? state.select.value : state.value) : (el.getAttribute("data-selected") || "");
       if (data.hasOwnProperty("tree_data")) {
-        renderTree(el, data.tree_data, data.hasOwnProperty("selected") ? data.selected : priorValue);
+        var nextValue = data.hasOwnProperty("selected") ? data.selected : priorValue;
+        try {
+          renderTree(el, data.tree_data, nextValue);
+        } catch (e) {
+          if (window.console && console.error) {
+            console.error(
+              "industryTreeInput (#" + (el.id || "?") + "): failed to re-render the tree widget, " +
+              "falling back to a plain <select>. Please report this error:", e
+            );
+          }
+          renderFallback(el, data.tree_data, nextValue);
+        }
       } else if (data.hasOwnProperty("selected")) {
-        setValue(el, data.selected);
+        setValueAny(el, data.selected);
       }
       $(el).trigger("change");
     }
