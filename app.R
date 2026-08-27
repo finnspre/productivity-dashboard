@@ -48,6 +48,14 @@ CATEGORICAL_PALETTE <- c(
              # universal hover/focus/active-state colour: active tab fill,
              # link hover, industry-tree hover/selected highlight)
 )
+# Hard cap on the Compare/Data tabs' active series list -- tied to
+# length(CATEGORICAL_PALETTE) rather than a separate literal 8, so the two
+# stay in sync automatically if the palette is ever resized: past this many
+# series_color_map() would start reusing colours (see its own fallback
+# below), which defeats the point of a colour-coded chart/chip list, so
+# "Add series" is disabled once active_pairs() hits this count instead of
+# letting the chart quietly degrade.
+MAX_ACTIVE_SERIES <- length(CATEGORICAL_PALETTE)
 # Secondary channel (colour-blind/print/grayscale accessibility) for series
 # identity, cycled alongside CATEGORICAL_PALETTE by index -- see
 # series_color_map() and the Compare tab's per-series trace loop. 6 values
@@ -1297,6 +1305,10 @@ tab_module_ui <- function(id, init_df, kind, variable_choices, industry_tree) {
         # observe() on input$pair_industry/input$pair_geography takes over
         # from here the moment the session connects, see tab_module_server().
         actionButton(ns("add_pair"), "Add series", icon = icon("plus"), disabled = NA),
+        # "N out of MAX series selected" -- reactive on active_pairs(), so it
+        # updates in lockstep with the chip list and the disabled state above
+        # instead of needing its own trigger.
+        uiOutput(ns("series_count_label")),
         tags$strong("Series to compare"),
         # Chip list replaces the old checkboxGroupInput -- active_pairs()
         # drives this reactively via renderUI, so unlike the checkbox
@@ -1309,11 +1321,6 @@ tab_module_ui <- function(id, init_df, kind, variable_choices, industry_tree) {
         # once the list is actually empty, same toggleDisabled mechanism
         # Add series uses.
         actionButton(ns("clear_pairs"), "Clear comparisons", icon = icon("trash-can"), class = "btn-sm"),
-        p(
-          class = "text-muted small",
-          "Click × on a chip to remove it, or Clear comparisons to remove them all. ",
-          "Charts stay readable up to about 6 series at once."
-        ),
         if (kind == "table") {
           # Data tab: every control sits directly in the sidebar, always
           # visible -- no chevron disclosure (this is the one tab whose
@@ -1481,20 +1488,50 @@ tab_module_server <- function(id, raw_data, kind) {
     # any industry with any geography.
     active_pairs <- reactiveVal(default_pair_row())
 
-    # "Add series" only makes sense once both pickers hold a real value --
-    # isTruthy() treats "" (pair_industry's "nothing selected" value) and
+    # The MAX_ACTIVE_SERIES cap is a Compare-tab-only thing (kind == "bar")
+    # -- it exists so every active series still gets its own distinct colour
+    # off CATEGORICAL_PALETTE, which only the chart cares about. The Data
+    # tab (kind == "table") just lists rows, so there's no colour budget to
+    # protect and no reason to stop it at 8. Inf makes every `< max_series`
+    # check below a no-op there instead of needing a separate branch per check.
+    max_series <- if (kind == "bar") MAX_ACTIVE_SERIES else Inf
+
+    # "Add series" only makes sense once both pickers hold a real value AND
+    # (Compare tab only) the list is under the max_series cap -- isTruthy()
+    # treats "" (pair_industry's "nothing selected" value) and
     # character(0)/NULL (pair_geography's) the same way req() elsewhere in
-    # this module already does, so this and the req() inside the
-    # add_pair observer below always agree on what counts as "ready".
+    # this module already does, so this and the req() inside the add_pair
+    # observer below always agree on what counts as "ready".
     observe({
-      ready <- isTruthy(input$pair_industry) && isTruthy(input$pair_geography)
+      ready <- isTruthy(input$pair_industry) && isTruthy(input$pair_geography) &&
+        nrow(active_pairs()) < max_series
       session$sendCustomMessage("toggleDisabled", list(id = session$ns("add_pair"), disabled = !ready))
+    })
+
+    # "N out of MAX series selected" next to the Add series button -- the
+    # only place the cap itself is explained, since the button just goes
+    # disabled with no explanation on its own. Compare-tab-only, same as the
+    # cap it's describing -- the Data tab has nothing to explain here.
+    output$series_count_label <- renderUI({
+      if (kind != "bar") return(NULL)
+      n <- nrow(active_pairs())
+      tags$p(
+        class = "text-muted small",
+        sprintf("%d out of %d series selected", n, max_series),
+        if (n >= max_series) " -- remove one to add another." else NULL
+      )
     })
 
     observeEvent(input$add_pair, {
       req(input$pair_industry, input$pair_geography)
-      key <- pair_key(input$pair_industry, input$pair_geography)
       current <- active_pairs()
+      # Belt-and-suspenders alongside the disabled state above -- guards the
+      # rare case a click already in flight lands after the button's just
+      # been disabled (e.g. a second series added elsewhere in the same
+      # session tick), rather than trusting the UI toggle alone to never let
+      # a 9th series through. A no-op on the Data tab, where max_series is Inf.
+      req(nrow(current) < max_series)
+      key <- pair_key(input$pair_industry, input$pair_geography)
       if (!(key %in% current$PairKey)) {
         # Same geography + a hierarchy relationship (parent or child, either
         # direction) means the two series aren't independent -- one already
@@ -1504,11 +1541,20 @@ tab_module_server <- function(id, raw_data, kind) {
         # exactly the point (e.g. showing a subsector diverging from its
         # sector), so this just makes the overlap visible rather than
         # silently assuming it's a mistake.
+        # vapply, not mapply -- mapply's default SIMPLIFY=TRUE returns a
+        # zero-length *list* (not a logical(0) vector) when current$Industry
+        # is empty (e.g. right after Clear comparisons), and `&` can't
+        # operate against a list even an empty one ("operations are possible
+        # only for numeric, logical or complex types"). vapply's declared
+        # FUN.VALUE = logical(1) guarantees a real logical vector -- length
+        # 0 included -- so this stays a no-op instead of crashing the app
+        # the moment the very next series gets added to an empty list.
         related <- current[
           current$Geography == input$pair_geography &
-            mapply(
+            vapply(
+              current$Industry,
               function(i) industry_is_ancestor(i, input$pair_industry) || industry_is_ancestor(input$pair_industry, i),
-              current$Industry
+              logical(1), USE.NAMES = FALSE
             ),
         ]
         if (nrow(related) > 0) {
