@@ -52,4 +52,36 @@
       filename: "productivity_" + (slug || "chart") + "_" + today
     });
   };
+
+  // Hides the #app-splash "Starting the application" / "Loading data"
+  // overlay (see ui()/page_fillable() in app.R) once the app has actually
+  // finished its first real work -- shiny:idle (not shiny:sessioninitialized,
+  // which fires as soon as the server's init message arrives, before the
+  // default view has actually rendered) is the first point the initial
+  // chart is genuinely done computing. .one(), not .on() -- only the very
+  // first idle matters; every later busy/idle cycle is a normal chart
+  // update, handled by useBusyIndicators() instead (see app.R), not this
+  // splash. The 8s timeout is a failsafe only, in case that first
+  // busy/idle cycle is ever skipped entirely.
+  $(document).one("shiny:idle", hideSplash);
+  setTimeout(hideSplash, 8000);
+  function hideSplash() {
+    var el = document.getElementById("app-splash");
+    if (!el) return;
+    el.classList.add("app-splash-hidden");
+    setTimeout(function () { el.remove(); }, 400);
+  }
+
+  // Turns the #shiny-disconnected-overlay Shiny itself injects/removes on
+  // disconnect (styled in csls-shiny-theme.css) into a working "Connection
+  // lost -- click to reload" retry action -- a plain document-level
+  // delegated listener, not one bound to the overlay element directly,
+  // since that element doesn't exist yet at page load and Shiny gives no
+  // JS hook to attach to the moment it's created. A no-op the rest of the
+  // time (nothing on the page ever carries this id while connected).
+  document.addEventListener("click", function (e) {
+    if (e.target && e.target.id === "shiny-disconnected-overlay") {
+      window.location.reload();
+    }
+  });
 })();

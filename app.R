@@ -356,6 +356,21 @@ updateIndustryTreeInput <- function(session, inputId, tree_data = NULL, selected
 # ::: for the sake of one two-line helper.
 dropNulls <- function(x) x[!vapply(x, is.null, logical(1))]
 
+# Thin wrapper around showNotification() -- every call site in this app
+# passes only `ui`/`type`, so this is all that needs wrapping. Centralizes
+# duration/behaviour tuning in one place instead of 4 call sites drifting.
+# duration=12 (up from Shiny's own 5s default) -- these messages (esp. the
+# ones interpolating a list of dropped industries/series) can run long, and
+# 5s wasn't enough time to read one before it vanished. The close button
+# (closeButton=TRUE is already Shiny's default) is what lets someone
+# dismiss it sooner if they don't need the full 12s -- see the
+# .shiny-notification-close styling in csls-shiny-theme.css, which is what
+# actually makes that button visible/obvious; it already existed in the DOM
+# before, just unstyled.
+csls_notify <- function(ui, type = c("default", "message", "warning", "error"), duration = 12, ...) {
+  showNotification(ui, type = match.arg(type), duration = duration, ...)
+}
+
 # data_pipeline.R pulls Stats Canada table 36-10-0480-01 then shapes/
 # renames it into Year/Geography/Variable/Industry/
 # IndustryLevel/Value/UOM columns.
@@ -426,14 +441,38 @@ cached_load_lp_data <- function(path = LP_DATA_FILE) {
   LP_DATA_CACHE$df
 }
 
+# tryCatch wrapper around cached_load_lp_data() -- turns a missing/corrupt
+# lp_data.RData into a NULL sentinel instead of a thrown error, so neither
+# consumer below (ui()'s per-request load, or RAW_DATA_READER's periodic
+# poll) crashes outright. Both call this instead of cached_load_lp_data()
+# directly now. Self-healing: cached_load_lp_data() only updates
+# LP_DATA_CACHE$mtime on success, so a failed load here doesn't poison the
+# cache -- the very next call (next poll, or the next page request) just
+# retries load_lp_data() fresh, and picks it up the moment the file is
+# fixed/reappears, no manual recovery step needed. See "Application
+# unavailable" (unavailable_page(), below ui()) and the raw_data()-is-NULL
+# validate() guards in each tab's scoped_raw().
+safe_load_lp_data <- function(path = LP_DATA_FILE) {
+  tryCatch(
+    cached_load_lp_data(path),
+    error = function(e) {
+      warning("safe_load_lp_data(): ", conditionMessage(e), call. = FALSE)
+      NULL
+    }
+  )
+}
+
 # Check lp_data.RData for modifications every 6000 seconds (10 minutes) by default
 # but allow tests to override this to avoid waiting 10 real minutes for a test to exercise the reactiveFileReader.
 # Session = NULL means this reader isn't tied to (or
 # torn down with) any one visitor's session.
 RAW_DATA_POLL_MS <- as.numeric(Sys.getenv("RAW_DATA_POLL_MS", 10 * 60 * 1000))
-# cached_load_lp_data (not load_lp_data directly) -- see LP_DATA_CACHE above,
-# this is what lets ui()'s init_df and this reactive share one in-memory load.
-RAW_DATA_READER <- reactiveFileReader(RAW_DATA_POLL_MS, session = NULL, LP_DATA_FILE, cached_load_lp_data)
+# safe_load_lp_data (not cached_load_lp_data directly) -- see LP_DATA_CACHE
+# above for the shared in-memory load, and safe_load_lp_data() for why this
+# needs to never throw: if the file disappears/corrupts mid-session, every
+# tab's scoped_raw() guards against raw_data() being NULL (see "No matching
+# data" state) instead of this reactive's next poll crashing the whole app.
+RAW_DATA_READER <- reactiveFileReader(RAW_DATA_POLL_MS, session = NULL, LP_DATA_FILE, safe_load_lp_data)
 
 ordered_unique <- function(values, preferred_order) {
   known <- preferred_order[preferred_order %in% values]
@@ -794,7 +833,11 @@ trend_tab_server <- function(id, raw_data) {
     # session connect (bindEvent()'s default) redid that work for nothing
     # and re-pushed an identical Industry tree over the websocket.
     observe({
-      df <- raw_data()
+      # req(), not a bare assignment -- raw_data() can be NULL if
+      # safe_load_lp_data() ever fails mid-session (see "No matching data"
+      # state); this just leaves the pickers as they were rather than
+      # erroring on df$Variable/df$Industry below.
+      df <- req(raw_data())
 
       variable_choices <- series_choices(df, "Variable", VARIABLE_ORDER)
       new_variable <- if (is.null(input$variable) || !(input$variable %in% variable_choices)) {
@@ -843,6 +886,11 @@ trend_tab_server <- function(id, raw_data) {
     # filtering/looping needed, but SeriesLabel is still added so
     # build_export_df()/export_column_labels() work completely unchanged.
     scoped_raw <- reactive({
+      # NULL only if safe_load_lp_data() failed mid-session (lp_data.RData
+      # deleted/corrupted after this session already connected) -- a
+      # validate(), not req(), so every chart/table downstream shows this
+      # message instead of just going blank. See "No matching data" state.
+      validate(need(!is.null(raw_data()), "Data is temporarily unavailable -- please try again in a moment."))
       req(input$variable, input$industry, input$geography)
       raw_data() %>%
         filter(Variable == input$variable, Industry == input$industry, Geography == input$geography) %>%
@@ -897,7 +945,7 @@ trend_tab_server <- function(id, raw_data) {
 
     observeEvent(rebase_missing(), {
       if (isTRUE(rebase_missing())) {
-        showNotification(
+        csls_notify(
           paste0(
             "No ", input$base_year, " data for this series -- excluded from the rebased view."
           ),
@@ -914,7 +962,16 @@ trend_tab_server <- function(id, raw_data) {
 
     output$chart <- renderPlotly({
       df <- filtered_data() %>% filter(!is.na(DisplayValue)) %>% arrange(Year)
-      req(nrow(df) > 0)
+      # Distinct from history_with_growth()'s own validate() above -- rows
+      # can exist there (a real Variable/Industry/Geography match) but still
+      # end up all-NA here, e.g. Growth view with only one year in range
+      # (lag() has nothing to diff against). Previously a bare req(), which
+      # blanked the chart with no explanation, indistinguishable from still
+      # loading -- see "No matching data" state.
+      validate(need(
+        nrow(df) > 0,
+        "No values to plot for this view -- try widening the year range, switching off Growth view, or turning off Rebase."
+      ))
       axis_title <- display_axis_title(input$view_mode, input$rebase_toggle, input$base_year, input$variable, variable_uom())
       fmt <- metric_format_spec(variable_uom(), input$view_mode, input$rebase_toggle)
       line_color <- CATEGORICAL_PALETTE[1]
@@ -1083,7 +1140,9 @@ ranking_tab_server <- function(id, raw_data) {
     # sync observe(): ui() already built this session's initial widgets from
     # the same raw_data(), so this only needs to fire on a real data change.
     observe({
-      df <- raw_data()
+      # req(), not a bare assignment -- see the matching comment on the
+      # Trends tab's own sync observe().
+      df <- req(raw_data())
 
       variable_choices <- series_choices(df, "Variable", VARIABLE_ORDER)
       new_variable <- if (is.null(input$variable) || !(input$variable %in% variable_choices)) {
@@ -1113,6 +1172,8 @@ ranking_tab_server <- function(id, raw_data) {
     }) |> bindEvent(raw_data(), once = FALSE, ignoreInit = TRUE)
 
     scoped_raw <- reactive({
+      # See the matching comment on the Trends tab's own scoped_raw().
+      validate(need(!is.null(raw_data()), "Data is temporarily unavailable -- please try again in a moment."))
       req(input$variable, input$geography, input$industry_level)
       raw_data() %>%
         filter(
@@ -1160,7 +1221,7 @@ ranking_tab_server <- function(id, raw_data) {
     observeEvent(ranking_dropped_industries(), {
       dropped <- ranking_dropped_industries()
       if (length(dropped) > 0) {
-        showNotification(
+        csls_notify(
           paste0(
             "Missing start/end-year data for: ", paste(dropped, collapse = ", "),
             " -- excluded from the ranking."
@@ -1172,7 +1233,14 @@ ranking_tab_server <- function(id, raw_data) {
 
     output$chart <- renderPlotly({
       rd <- ranking_data() %>% filter(!is.na(CAGR)) %>% arrange(CAGR)
-      req(nrow(rd) > 0)
+      # Distinct from ranking_data()'s own validate() -- rows can exist
+      # there but still end up all-NA CAGR here (every matched industry
+      # lacks a value at the start or end year, or has a 0 start value).
+      # Previously a bare req() -- see "No matching data" state.
+      validate(need(
+        nrow(rd) > 0,
+        "No industries have data at both the start and end of the selected time frame -- pick a different range."
+      ))
       rd$Industry <- factor(rd$Industry, levels = rd$Industry)
 
       # Same ranked CAGR data either way -- scatter (one point per industry,
@@ -1428,7 +1496,9 @@ tab_module_server <- function(id, raw_data, kind) {
     # same raw_data(), so this only needs to fire on a real data change, not
     # redundantly again for every new session.
     observe({
-      df <- raw_data()
+      # req(), not a bare assignment -- see the matching comment on the
+      # Trends tab's own sync observe().
+      df <- req(raw_data())
 
       variable_choices <- series_choices(df, "Variable", VARIABLE_ORDER)
       current_variable <- input$variable
@@ -1558,7 +1628,7 @@ tab_module_server <- function(id, raw_data, kind) {
             ),
         ]
         if (nrow(related) > 0) {
-          showNotification(
+          csls_notify(
             paste0(
               "Heads up: \"", input$pair_industry, "\" overlaps with \"",
               paste(related$Industry, collapse = "\", \""), "\" in the industry hierarchy for ",
@@ -1647,6 +1717,8 @@ tab_module_server <- function(id, raw_data, kind) {
     # the rest of the reactive chain doesn't need to know pairs exist --
     # it's already generic over "some series dimension".
     scoped_raw <- reactive({
+      # See the matching comment on the Trends tab's own scoped_raw().
+      validate(need(!is.null(raw_data()), "Data is temporarily unavailable -- please try again in a moment."))
       raw_data() %>%
         filter(Variable == input$variable) %>%
         mutate(SeriesLabel = pair_label(Industry, Geography))
@@ -1726,7 +1798,7 @@ tab_module_server <- function(id, raw_data, kind) {
     observeEvent(rebase_missing_series(), {
       missing <- rebase_missing_series()
       if (length(missing) > 0) {
-        showNotification(
+        csls_notify(
           paste0(
             "No ", input$base_year, " data for: ", paste(missing, collapse = ", "),
             " -- excluded from the rebased view."
@@ -1764,7 +1836,14 @@ tab_module_server <- function(id, raw_data, kind) {
       # kind == "bar" (the only other kind this shared module still serves)
       output$chart <- renderPlotly({
         df <- filtered_data() %>% filter(!is.na(DisplayValue))
-        req(nrow(df) > 0)
+        # Distinct from history_with_growth()'s own validate() -- rows can
+        # exist there but still end up all-NA here (e.g. Growth view with
+        # only one year in range). Previously a bare req() -- see "No
+        # matching data" state.
+        validate(need(
+          nrow(df) > 0,
+          "No values to plot for this view -- try widening the year range, switching off Growth view or Rebase, or adding a different series."
+        ))
         pal <- colors()
         sty <- styles()
         series <- series_choices(df, "SeriesLabel")
@@ -1909,7 +1988,7 @@ tab_module_server <- function(id, raw_data, kind) {
           sprintf("productivity_full-dataset_%s.csv", format(Sys.Date(), "%Y%m%d"))
         },
         content = function(file) {
-          out <- raw_data() %>%
+          out <- req(raw_data()) %>%
             arrange(Variable, Geography, Industry, Year) %>%
             select(Year, Geography, Industry, Variable, Value, UOM)
           write.csv(out, file, row.names = FALSE)
@@ -1919,16 +1998,60 @@ tab_module_server <- function(id, raw_data, kind) {
   })
 }
 
+# "Application unavailable" -- ui()'s fallback when safe_load_lp_data()
+# can't produce a data frame at all (lp_data.RData missing/corrupt). A
+# standalone page_fillable(), same shape as trend_tab_ui()/tab_module_ui(),
+# built with no dependency on init_df/variable_choices/industry_tree so it
+# never itself touches the data that just failed to load. Reuses the real
+# page's font link + theme stylesheet so it still looks like this app, not
+# a bare error page.
+unavailable_page <- function() {
+  page_fillable(
+    title = "Canadian Productivity Dashboard",
+    tags$head(
+      tags$link(
+        rel = "stylesheet",
+        href = "https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;800&display=swap"
+      )
+    ),
+    tags$style(HTML(sprintf(
+      "html { color-scheme: light; }
+       body {
+         padding: 2rem 2.5rem; background-color: %s; font-family: %s; color: %s;
+         display: flex; align-items: center; justify-content: center; min-height: 100vh;
+       }
+       .app-unavailable-card { max-width: 480px; text-align: center; }
+       .app-unavailable-card h1 { font-size: 22px; font-weight: 600; color: %s; margin-bottom: 0.75rem; }
+       .app-unavailable-card p { font-size: 14px; font-weight: 300; color: %s; line-height: 1.6; }",
+      GRIDLINE, FONT_FAMILY, INK_PRIMARY, BRAND_MAPLE_BLUE, INK_MUTED
+    ))),
+    tags$div(
+      class = "card app-unavailable-card",
+      tags$h1("Application unavailable"),
+      tags$p(
+        "The productivity dataset couldn't be loaded. If you're able to, try running ",
+        tags$code("data_pipeline.R"), " from this project folder to regenerate ",
+        tags$code("lp_data.RData"), ", then reload this page. If this persists, contact the ",
+        "site maintainer."
+      )
+    ),
+    tags$link(rel = "stylesheet", type = "text/css", href = versioned_asset("csls-shiny-theme.css"))
+  )
+}
+
 ui <- function(request) {
   # ui() runs per HTTP
   # request, before any session/reactive context exists, so it can't read
   # a reactive value. Computed directly from the data at page-build time
   # (not via a server-side update*Input call) so the default selection is
   # already present in the first HTML the browser receives.
-  # cached_load_lp_data(), not load_lp_data() -- see LP_DATA_CACHE -- so a
-  # repeat page view doesn't pay the ~1.6s parse cost again; only the first
-  # request after the file actually changes does.
-  init_df <- cached_load_lp_data()
+  # safe_load_lp_data(), not cached_load_lp_data() directly -- see
+  # LP_DATA_CACHE -- so a repeat page view doesn't pay the ~1.6s parse cost
+  # again (only the first request after the file actually changes does),
+  # and a missing/corrupt file short-circuits to unavailable_page() instead
+  # of crashing UI generation with a raw R error.
+  init_df <- safe_load_lp_data()
+  if (is.null(init_df)) return(unavailable_page())
   # Computed once and threaded through to the 4 tab-UI builders below,
   # instead of each of them independently recomputing the same
   # series_choices()/industry_tree_nodes() result from the same init_df --
@@ -1940,6 +2063,18 @@ ui <- function(request) {
   industry_tree <- industry_tree_nodes(init_df)
 
   page_fillable(
+    # Turns on Shiny's own built-in busy indicators (shiny >= 1.8; NOT a
+    # bslib feature despite living right next to bslib's own page_fillable()
+    # -- bslib::busy_indicators() doesn't exist, confirmed against the
+    # installed package) -- spinners = a spinner overlay on any
+    # plotlyOutput/DTOutput/uiOutput while it carries Shiny's own
+    # .recalculating class (the "updating a chart" state), pulse = a
+    # top-of-page progress bar for everything else Shiny is busy with (e.g.
+    # RAW_DATA_READER's periodic re-poll). Both self-theme off
+    # --shiny-spinner-color/--shiny-pulse-background below -- see the
+    # tags$style() block right after this tag. Must be placed in the UI
+    # itself; it is not a bs_theme()/options() setting.
+    useBusyIndicators(),
     title = "Canadian Productivity Dashboard", # browser tab title only -- no on-page heading
     # Roboto -- the exact font csls.ca loads (see CSLS-Shiny-Style-Spec.md
     # section 3) -- at the 4 weights the theme actually uses (300/400/600/
@@ -1951,6 +2086,63 @@ ui <- function(request) {
         href = "https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;800&display=swap"
       )
     ),
+    # Brand colours for useBusyIndicators() above -- these are real CSS
+    # custom properties shiny's own busy-indicators.css reads
+    # (var(--shiny-spinner-color, ...)/var(--shiny-pulse-background, ...)),
+    # confirmed by reading that stylesheet directly. Overriding them here is
+    # deliberately simpler than introducing a bs_theme() object just for
+    # this -- page_fillable() has never taken an explicit theme in this app,
+    # and every other brand-colour override already works exactly this way
+    # (a tags$style() block against named constants, see BRAND_MAPLE_BLUE/
+    # BRAND_JETS_BLUE above). spinner_delay dropped from Shiny's stock 1s to
+    # 300ms -- these recomputes are directly filter-driven, so the user
+    # expects prompt affirmation, not a delay tuned to avoid flicker on
+    # sub-second background work.
+    tags$style(HTML(sprintf(
+      ":root {
+         --shiny-spinner-color: %s;
+         --shiny-spinner-delay: 300ms;
+         --shiny-pulse-background: linear-gradient(120deg, transparent, %s, %s, transparent);
+       }",
+      BRAND_JETS_BLUE, BRAND_MAPLE_BLUE, BRAND_JETS_BLUE
+    ))),
+    # "Starting the application" / "Loading data" splash -- literal
+    # server-rendered HTML (not built by JS), so it's part of the very first
+    # response ui(request) sends and is visible before Shiny's JS bundle has
+    # even downloaded, let alone connected. Hidden by www/ui_helpers.js on
+    # the first shiny:idle event (see there for why not
+    # shiny:sessioninitialized). Copy is fixed rather than conditioned on
+    # cache warmth -- this app deploys to Posit Connect Cloud, which can
+    # spin up a cold instance in response to the very first request after a
+    # period of inactivity, so the wording needs to read right whether the
+    # user waited 200ms or several seconds; nothing on this page can render
+    # any *earlier* than this even in the cold-instance case, since zero
+    # HTTP bytes exist yet for the browser to show until this response
+    # starts arriving.
+    tags$div(
+      id = "app-splash",
+      tags$div(class = "app-splash-spinner"),
+      tags$p(class = "app-splash-text", "Loading dashboard…"),
+      tags$p(class = "app-splash-subtext", "This may take a few seconds on the first visit.")
+    ),
+    tags$style(HTML(sprintf(
+      "#app-splash {
+         position: fixed; inset: 0; z-index: 100000;
+         display: flex; flex-direction: column; align-items: center; justify-content: center;
+         gap: 0.75rem; background: %s; font-family: %s;
+         transition: opacity 280ms ease;
+       }
+       #app-splash.app-splash-hidden { opacity: 0; pointer-events: none; }
+       .app-splash-spinner {
+         width: 40px; height: 40px; border-radius: 50%%;
+         border: 4px solid %s; border-top-color: %s;
+         animation: app-splash-spin 0.8s linear infinite;
+       }
+       @keyframes app-splash-spin { to { transform: rotate(360deg); } }
+       .app-splash-text { font-size: 16px; font-weight: 600; color: %s; margin: 0; }
+       .app-splash-subtext { font-size: 13px; font-weight: 300; color: %s; margin: 0; }",
+      CHART_SURFACE, FONT_FAMILY, GRIDLINE, BRAND_JETS_BLUE, INK_PRIMARY, INK_MUTED
+    ))),
     # page() renders straight into <body> with no margin/padding of its
     # own, so the intro text would otherwise butt right up against the
     # browser edge -- give the whole page some breathing room on top/sides.
@@ -2192,6 +2384,19 @@ ui <- function(request) {
 }
 
 server <- function(input, output, session) {
+  # Off by default in Shiny -- without this, a dropped websocket (a brief
+  # network blip, not a crashed R process) never even attempts to resume;
+  # it goes straight to the "Connection lost" full-page state (see
+  # #shiny-disconnected-overlay styling in csls-shiny-theme.css) with no
+  # chance to recover in place. This lets Shiny's own reconnect attempt (its
+  # "Attempting to reconnect... Try now" toast, restyled alongside every
+  # other showNotification() in this app) run first; the click-to-reload
+  # overlay stays as the fallback for when reconnection genuinely can't
+  # succeed (e.g. the R process itself died, as in the mapply/`&` crash
+  # fixed earlier -- reconnecting to a dead process can't help, so that
+  # class of error still ends up at the overlay regardless of this setting).
+  session$allowReconnect(TRUE)
+
   raw_data <- RAW_DATA_READER # single shared reactiveFileReader, not duplicated per tab
 
   trend_tab_server("trend", raw_data)

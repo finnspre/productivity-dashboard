@@ -849,3 +849,61 @@ table.dataTable tbody tr:hover td { background: rgba(5, 152, 216, .06); }
   h3, .h3 { font-size: 20px; }
   .nav-tabs > li > a, .nav-tabs .nav-link { padding: 12px 16px; font-size: 14px; }
 }
+
+/* ---------------------------------------------------------------------------
+   14. NOTIFICATIONS & CONNECTION STATUS -- showNotification() toasts (see
+   csls_notify() in app.R) and Shiny's own disconnected-overlay/reconnect-
+   prompt, which render through these same notification classes. Both were
+   previously unstyled (raw Bootstrap-era appearance).
+--------------------------------------------------------------------------- */
+#shiny-notification-panel { font-family: var(--font-base); }
+.shiny-notification {
+  border-radius: var(--radius-md);
+  border: none;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .16);
+  font-size: 14px;
+  font-weight: 300;
+}
+/* closeButton=TRUE (Shiny's own default) already puts a real, clickable
+   close element in the DOM for every csls_notify() call -- it just fell
+   back to raw Bootstrap grey with nothing here to style it, which is why
+   it read as absent/easy to miss rather than an obvious "click to dismiss
+   early" control. */
+.shiny-notification-close {
+  font-size: 1.4em;
+  color: var(--color-dark-grey);
+  border-radius: 50%;
+  transition: background-color 280ms ease, color 280ms ease;
+}
+.shiny-notification-close:hover {
+  color: var(--color-white);
+  background-color: var(--color-jets-blue);
+}
+
+/* Shiny injects/removes this div itself on disconnect/reconnect -- it is
+   always empty (confirmed by reading shiny.js directly), so this file must
+   never pre-place it in the UI (it would show permanently from first
+   paint) and content can only be added via ::after. pointer-events: auto +
+   cursor: pointer + the click-to-reload listener in ui_helpers.js turn the
+   whole overlay into a retry action, since Shiny's own reconnect (see
+   session$allowReconnect(TRUE) in app.R) can't help once the R process
+   itself is actually gone -- a fresh page load always can. */
+#shiny-disconnected-overlay {
+  background: rgba(1, 47, 114, .92); /* --color-maple-blue at high alpha, not Shiny's flat grey */
+  opacity: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+  cursor: pointer;
+}
+#shiny-disconnected-overlay::after {
+  content: "Connection lost \2014 click to reload";
+  color: var(--color-white);
+  font-family: var(--font-base);
+  font-weight: 600;
+  font-size: 20px;
+  text-align: center;
+  max-width: 420px;
+  padding: 0 24px;
+}
