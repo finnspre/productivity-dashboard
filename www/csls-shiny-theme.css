@@ -230,6 +230,30 @@ textarea:focus {
   outline: 0;
 }
 
+/* Shiny's selectize binding adds a "form-control" class onto the OUTER
+   .selectize-control wrapper (not just the inner .selectize-input box)
+   whenever the widget starts with no item selected -- true only for
+   pair_geography on the Compare/Data tabs (selected = character(0));
+   every other selectize picker in the app always has a default
+   selection and never gets this class. Selectize's own bundled CSS
+   neutralizes that wrapper back to invisible at rest (.form-control
+   .selectize-control { border: 0; border-radius: 0; ... }) so only the
+   inner, correctly-rounded .selectize-input shows through -- but the
+   :hover/:focus rule above also matches the wrapper via its own
+   ".form-control" class, and at equal specificity, loading later, it
+   wins the border back while the wrapper's border-radius stays zeroed.
+   That drew a sharp-cornered blue outline the same size as the
+   properly rounded box underneath it, i.e. the "shadow of a sharp
+   rectangle" instead of a rounded one. Re-neutralize the wrapper alone
+   on hover/focus at higher specificity so only the inner box's own
+   hover style (already correct, from the rule above) shows. */
+.selectize-control.form-control:hover,
+.selectize-control.form-control:focus,
+.selectize-control.form-control.focus {
+  border: 0;
+  box-shadow: none;
+}
+
 .form-control::placeholder,
 .selectize-input > input::placeholder {
   color: var(--color-dark-grey);

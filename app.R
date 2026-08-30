@@ -8,7 +8,7 @@ library(htmltools)
 LP_DATA_FILE <- Sys.getenv("LP_DATA_FILE", "lp_data.RData")
 
 # Appends a ?v=<mtime> cache-buster to a www/ asset path, so editing e.g.
-# industry_tree.js takes effect on a plain reload instead of silently
+# tree_select.js takes effect on a plain reload instead of silently
 # serving a stale cached copy from before the edit (the static file's
 # *name* doesn't change, and Shiny doesn't send cache-control headers that
 # would force revalidation on every load, so without this a browser that
@@ -46,7 +46,7 @@ CATEGORICAL_PALETTE <- c(
   "#F74C16", # Oilers Orange
   "#0598D8"  # Jets Blue -- slot 8 (see BRAND_JETS_BLUE below -- csls.ca's
              # universal hover/focus/active-state colour: active tab fill,
-             # link hover, industry-tree hover/selected highlight)
+             # link hover, tree-select hover/selected highlight)
 )
 # Hard cap on the Compare/Data tabs' active series list -- tied to
 # length(CATEGORICAL_PALETTE) rather than a separate literal 8, so the two
@@ -72,7 +72,7 @@ MARKER_SYMBOLS <- c("circle", "diamond", "square", "triangle-up", "cross", "x")
 # palette stay pinned to one source of truth. Chrome-only: the chart code
 # below keeps referencing CATEGORICAL_PALETTE[1] directly (unchanged) for the
 # Trends/Rankings single-series colour -- these two aliases are for the CSS
-# in ui() (nav-pills, links, the industry-tree dropdown, chip list) only.
+# in ui() (nav-pills, links, the tree-select dropdown, chip list) only.
 BRAND_MAPLE_BLUE <- CATEGORICAL_PALETTE[1] # default state: buttons, links, tab/nav text
 BRAND_JETS_BLUE <- CATEGORICAL_PALETTE[8]  # hover/focus/active state: tabs, links, highlights
 
@@ -278,12 +278,14 @@ INDUSTRY_PARENT <- c(
   "Wood product manufacturing" = "Manufacturing"
 )
 
-# Nested tree for the custom industryTreeInput widget (see
-# www/industry_tree.js for the paired Shiny.InputBinding): each node is
-# list(value=, label=, children=list(...)), built by walking INDUSTRY_PARENT
-# from the 3 root aggregates. Unlike the old flat indented-label vector this
-# replaces, the JS side gets real parent/child nesting, which is what lets
-# it render a collapsible tree and auto-expand ancestors of a search match.
+# Nested tree_data for the custom treeSelectInput widget (see
+# www/tree_select.js for the paired Shiny.InputBinding), Industry's own
+# case: each node is list(value=, label=, children=list(...)), built by
+# walking INDUSTRY_PARENT from the 3 root aggregates. Unlike the old flat
+# indented-label vector this replaces, the JS side gets real parent/child
+# nesting, which is what lets it render a collapsible tree and auto-expand
+# ancestors of a search match. Variable/Geography have no hierarchy of
+# their own, so they build tree_data with flat_tree_nodes() instead (below).
 industry_tree_nodes <- function(df) {
   available <- unique(df$Industry)
 
@@ -314,26 +316,36 @@ flatten_tree_values <- function(node) {
   c(node$value, unlist(lapply(node$children, flatten_tree_values), use.names = FALSE))
 }
 
-# UI generator for the collapsible tree-dropdown Industry picker. Mirrors
-# selectizeInput's single-value contract: the value Shiny sees is always a
-# plain character(1) Industry name, or "" for "nothing selected" -- never
-# NULL/character(0) -- so req()/isTruthy() gating elsewhere didn't need to
-# change just because the widget underneath did. All the interactive markup
-# (toggle button, search box, expandable rows) is built client-side by
-# www/industry_tree.js from the embedded JSON below; this only emits the
-# skeleton the binding hydrates.
-industryTreeInput <- function(inputId, label = NULL, tree_data, selected = NULL,
-                               placeholder = "Search industries...", width = NULL) {
+# tree_data for a treeSelectInput() with no hierarchy of its own -- every
+# node is a root, `children = list()` -- used for Variable/Geography, where
+# industry_tree_nodes()'s parent-walk doesn't apply. `choices` is expected
+# already in display order (e.g. series_choices()'s VARIABLE_ORDER/
+# GEOGRAPHY_ORDER); unlike industry_tree_nodes(), this doesn't re-sort.
+flat_tree_nodes <- function(choices) {
+  lapply(choices, function(x) list(value = x, label = x, children = list()))
+}
+
+# UI generator for the collapsible tree-style dropdown picker used for
+# Variable/Geography/Industry alike (Trends' sidebar; Industry alone on
+# Compare/Data). Mirrors selectizeInput's single-value contract: the value
+# Shiny sees is always a plain character(1), or "" for "nothing selected"
+# -- never NULL/character(0) -- so req()/isTruthy() gating elsewhere didn't
+# need to change just because the widget underneath did. All the
+# interactive markup (toggle input, chevron, expandable rows) is built
+# client-side by www/tree_select.js from the embedded JSON below; this only
+# emits the skeleton the binding hydrates.
+treeSelectInput <- function(inputId, label = NULL, tree_data, selected = NULL,
+                             placeholder = "Search...", width = NULL) {
   selected <- if (is.null(selected) || identical(selected, character(0))) "" else selected
   div(
-    class = "form-group shiny-input-container industry-tree-input",
+    class = "form-group shiny-input-container tree-select-input",
     style = css(width = validateCssUnit(width)),
     if (!is.null(label)) tags$label(class = "control-label", `for` = inputId, label),
     tags$div(
-      id = inputId, class = "industry-tree",
+      id = inputId, class = "tree-select",
       `data-selected` = selected, `data-placeholder` = placeholder,
       tags$script(
-        type = "application/json", class = "industry-tree-data",
+        type = "application/json", class = "tree-select-data",
         HTML(jsonlite::toJSON(tree_data, auto_unbox = TRUE))
       )
     )
@@ -346,7 +358,7 @@ industryTreeInput <- function(inputId, label = NULL, tree_data, selected = NULL,
 # element's receiveMessage(el, data) JS method, so no bespoke
 # session$sendCustomMessage()/session$onMessage() wiring is needed on
 # either side.
-updateIndustryTreeInput <- function(session, inputId, tree_data = NULL, selected = NULL) {
+updateTreeSelectInput <- function(session, inputId, tree_data = NULL, selected = NULL) {
   message <- dropNulls(list(tree_data = tree_data, selected = selected))
   session$sendInputMessage(inputId, message)
 }
@@ -767,28 +779,33 @@ trend_tab_ui <- function(id, init_df, variable_choices, geography_choices, indus
     layout_sidebar(
       sidebar = sidebar(
         id = ns("sidebar"),
-        selectInput(
+        # Variable/Geography/Industry all use the same treeSelectInput
+        # widget here (see www/tree_select.js) rather than Shiny's
+        # selectizeInput, so all three behave identically -- click/tab in
+        # blanks the box for a fresh search or scroll, picking an option (or
+        # not) is what shows/restores the display text. Variable and
+        # Geography have no hierarchy of their own, so their tree_data is
+        # just flat_tree_nodes() over the plain choice list -- same flat-
+        # list rendering Industry's own leaf rows already use.
+        treeSelectInput(
           ns("variable"), "Variable",
-          choices = variable_choices, selected = DEFAULT_VARIABLE
+          tree_data = flat_tree_nodes(variable_choices), selected = DEFAULT_VARIABLE,
+          placeholder = "Search variables..."
         ),
         uiOutput(ns("variable_definition")),
-        # selectize (the default) makes this a type-to-filter searchable
-        # dropdown rather than a native <select> -- worth it even with only
-        # 14 provinces/territories, for consistency with every other picker
-        # in the app.
-        selectInput(
+        treeSelectInput(
           ns("geography"), "Geography",
-          choices = geography_choices, selected = DEFAULT_GEOGRAPHY,
-          selectize = TRUE
+          tree_data = flat_tree_nodes(geography_choices), selected = DEFAULT_GEOGRAPHY,
+          placeholder = "Search geographies..."
         ),
         # Always the full Aggregate+2-digit+3-digit tree -- no separate
         # industry_level toggle (none of the tabs have one). Collapsible
-        # tree dropdown (see www/industry_tree.js) -- closed to just the 3
-        # root aggregates by default, arrow to expand a branch, click a
-        # label to pick it.
-        industryTreeInput(
+        # tree dropdown -- closed to just the 3 root aggregates by default,
+        # arrow to expand a branch, click a label to pick it.
+        treeSelectInput(
           ns("industry"), "Industry",
-          tree_data = industry_tree, selected = DEFAULT_INDUSTRY
+          tree_data = industry_tree, selected = DEFAULT_INDUSTRY,
+          placeholder = "Search industries..."
         ),
         # A native <details> disclosure -- zero extra JS dependencies,
         # keyboard-accessible by default. Verified (headless-browser +
@@ -882,7 +899,7 @@ trend_tab_server <- function(id, raw_data) {
       } else {
         input$variable
       }
-      updateSelectInput(session, "variable", choices = variable_choices, selected = new_variable)
+      updateTreeSelectInput(session, "variable", tree_data = flat_tree_nodes(variable_choices), selected = new_variable)
 
       geo_choices <- series_choices(df, "Geography", GEOGRAPHY_ORDER)
       new_geo <- if (is.null(input$geography) || !(input$geography %in% geo_choices)) {
@@ -890,14 +907,14 @@ trend_tab_server <- function(id, raw_data) {
       } else {
         input$geography
       }
-      updateSelectInput(session, "geography", choices = geo_choices, selected = new_geo)
+      updateTreeSelectInput(session, "geography", tree_data = flat_tree_nodes(geo_choices), selected = new_geo)
 
       new_industry <- if (is.null(input$industry) || !(input$industry %in% unique(df$Industry))) {
         DEFAULT_INDUSTRY
       } else {
         input$industry
       }
-      updateIndustryTreeInput(session, "industry", tree_data = industry_tree_nodes(df), selected = new_industry)
+      updateTreeSelectInput(session, "industry", tree_data = industry_tree_nodes(df), selected = new_industry)
 
       year_min <- min(df$Year)
       year_max <- max(df$Year)
@@ -1119,19 +1136,21 @@ ranking_tab_ui <- function(id, init_df, variable_choices, geography_choices) {
     layout_sidebar(
       sidebar = sidebar(
         id = ns("sidebar"),
-        selectInput(
+        # Same treeSelectInput widget as the Trends tab's Variable/
+        # Geography/Industry pickers (see www/tree_select.js and the
+        # matching comment on the Trends tab's sidebar) -- click/tab in
+        # blanks the box for a fresh search or scroll, picking an option
+        # (or not) is what shows/restores the display text.
+        treeSelectInput(
           ns("variable"), "Variable",
-          choices = variable_choices, selected = DEFAULT_VARIABLE
+          tree_data = flat_tree_nodes(variable_choices), selected = DEFAULT_VARIABLE,
+          placeholder = "Search variables..."
         ),
         uiOutput(ns("variable_definition")),
-        # selectize (the default) makes this a type-to-filter searchable
-        # dropdown rather than a native <select> -- worth it even with only
-        # 14 provinces/territories, for consistency with every other picker
-        # in the app.
-        selectInput(
+        treeSelectInput(
           ns("geography"), "Geography",
-          choices = geography_choices, selected = DEFAULT_GEOGRAPHY,
-          selectize = TRUE
+          tree_data = flat_tree_nodes(geography_choices), selected = DEFAULT_GEOGRAPHY,
+          placeholder = "Search geographies..."
         ),
         sliderInput(
           ns("year_range"), "Date range",
@@ -1210,7 +1229,7 @@ ranking_tab_server <- function(id, raw_data) {
       } else {
         input$variable
       }
-      updateSelectInput(session, "variable", choices = variable_choices, selected = new_variable)
+      updateTreeSelectInput(session, "variable", tree_data = flat_tree_nodes(variable_choices), selected = new_variable)
 
       geo_choices <- series_choices(df, "Geography", GEOGRAPHY_ORDER)
       new_geo <- if (is.null(input$geography) || !(input$geography %in% geo_choices)) {
@@ -1218,7 +1237,7 @@ ranking_tab_server <- function(id, raw_data) {
       } else {
         input$geography
       }
-      updateSelectInput(session, "geography", choices = geo_choices, selected = new_geo)
+      updateTreeSelectInput(session, "geography", tree_data = flat_tree_nodes(geo_choices), selected = new_geo)
 
       year_min <- min(df$Year)
       year_max <- max(df$Year)
@@ -1411,26 +1430,35 @@ tab_module_ui <- function(id, init_df, kind, variable_choices, industry_tree) {
     layout_sidebar(
       sidebar = sidebar(
         id = ns("sidebar"),
-        selectInput(
+        # Same treeSelectInput widget as the Trends/Rankings tabs' Variable/
+        # Geography/Industry pickers (see www/tree_select.js and the
+        # matching comment on the Trends tab's sidebar) -- click/tab in
+        # blanks the box for a fresh search or scroll, picking an option
+        # (or not) is what shows/restores the display text.
+        treeSelectInput(
           ns("variable"), "Variable",
-          choices = variable_choices, selected = DEFAULT_VARIABLE
+          tree_data = flat_tree_nodes(variable_choices), selected = DEFAULT_VARIABLE,
+          placeholder = "Search variables..."
         ),
         uiOutput(ns("variable_definition")),
         tags$strong("Compare"),
-        # Collapsible tree dropdown (see www/industry_tree.js) -- closed to
-        # just the 3 root aggregates by default, arrow to expand a branch,
-        # click a label to pick it. Natively supports an empty "nothing
-        # selected" state (reported as ""), so unlike the old selectize
-        # picker this replaces, no leading blank "" choice trick is needed
-        # to make the box start empty.
-        industryTreeInput(
+        # Collapsible tree dropdown -- closed to just the 3 root aggregates
+        # by default, arrow to expand a branch, click a label to pick it.
+        # Natively supports an empty "nothing selected" state (reported as
+        # ""), so unlike the old selectize picker this replaces, no leading
+        # blank "" choice trick is needed to make the box start empty.
+        treeSelectInput(
           ns("pair_industry"), "Industry",
-          tree_data = industry_tree, selected = NULL
+          tree_data = industry_tree, selected = NULL,
+          placeholder = "Search industries..."
         ),
-        selectizeInput(
+        # Same empty-string "nothing selected" contract as pair_industry
+        # above -- no leading blank "" choice needed the way the old
+        # selectizeInput this replaces required.
+        treeSelectInput(
           ns("pair_geography"), "Geography",
-          choices = c("", GEOGRAPHY_ORDER), selected = character(0),
-          options = list(placeholder = "Search geographies...")
+          tree_data = flat_tree_nodes(GEOGRAPHY_ORDER), selected = NULL,
+          placeholder = "Search geographies..."
         ),
         # Starts disabled (both pickers are blank on load) -- the server's
         # observe() on input$pair_industry/input$pair_geography takes over
@@ -1591,16 +1619,16 @@ tab_module_server <- function(id, raw_data, kind) {
       } else {
         current_variable
       }
-      updateSelectInput(session, "variable", choices = variable_choices, selected = new_variable)
+      updateTreeSelectInput(session, "variable", tree_data = flat_tree_nodes(variable_choices), selected = new_variable)
 
       geo_choices <- series_choices(df, "Geography", GEOGRAPHY_ORDER)
       current_geo <- input$pair_geography
-      new_geo <- if (is.null(current_geo) || !(current_geo %in% geo_choices)) {
-        character(0)
+      new_geo <- if (is.null(current_geo) || !nzchar(current_geo) || !(current_geo %in% geo_choices)) {
+        ""
       } else {
         current_geo
       }
-      updateSelectizeInput(session, "pair_geography", choices = c("", geo_choices), selected = new_geo)
+      updateTreeSelectInput(session, "pair_geography", tree_data = flat_tree_nodes(geo_choices), selected = new_geo)
 
       current_industry <- input$pair_industry
       new_industry <- if (is.null(current_industry) || !nzchar(current_industry) ||
@@ -1609,7 +1637,7 @@ tab_module_server <- function(id, raw_data, kind) {
       } else {
         current_industry
       }
-      updateIndustryTreeInput(session, "pair_industry", tree_data = industry_tree_nodes(df), selected = new_industry)
+      updateTreeSelectInput(session, "pair_industry", tree_data = industry_tree_nodes(df), selected = new_industry)
 
       year_min <- min(df$Year)
       year_max <- max(df$Year)
@@ -1651,11 +1679,12 @@ tab_module_server <- function(id, raw_data, kind) {
     max_series <- if (kind == "bar") MAX_ACTIVE_SERIES else Inf
 
     # "Add series" only makes sense once both pickers hold a real value AND
-    # (Compare tab only) the list is under the max_series cap -- isTruthy()
-    # treats "" (pair_industry's "nothing selected" value) and
-    # character(0)/NULL (pair_geography's) the same way req() elsewhere in
-    # this module already does, so this and the req() inside the add_pair
-    # observer below always agree on what counts as "ready".
+    # (Compare tab only) the list is under the max_series cap -- both
+    # pickers report "" for "nothing selected" (treeSelectInput's shared
+    # contract, see the comment on its definition), which isTruthy() treats
+    # as falsy the same way req() elsewhere in this module already does, so
+    # this and the req() inside the add_pair observer below always agree on
+    # what counts as "ready".
     observe({
       ready <- isTruthy(input$pair_industry) && isTruthy(input$pair_geography) &&
         nrow(active_pairs()) < max_series
@@ -1736,8 +1765,8 @@ tab_module_server <- function(id, raw_data, kind) {
       # add -- so adding a series always ends with a clean search box ready
       # for the next pick, instead of leaving the just-added pick sitting
       # there looking like unconsumed input.
-      updateSelectizeInput(session, "pair_geography", selected = character(0))
-      updateIndustryTreeInput(session, "pair_industry", selected = "")
+      updateTreeSelectInput(session, "pair_geography", selected = "")
+      updateTreeSelectInput(session, "pair_industry", selected = "")
     })
 
     # Chip list for the active series -- reactive on active_pairs(), so
@@ -2359,53 +2388,70 @@ ui <- function(request) {
        .download-dropdown .dropdown-item { white-space: normal; }"
     )),
     tags$style(HTML(sprintf(
-      "/* Collapsible Industry tree dropdown (see www/industry_tree.js) --
-          toggle styled to csls.ca's own form-control spec (42px tall, 8px
-          radius, 14px/weight-300 text, rgba(0,0,0,.24) hairline border,
-          jets blue on hover/focus -- CSLS-Shiny-Style-Spec.md section 4) so
-          it reads as the same control family as the Geography selectize
-          box next to it, not a separately hand-matched approximation of
-          it. Chevron reuses .trend-more-options' rotate-on-open technique
-          above. */
-       .industry-tree { position: relative; width: 100%%; }
-       .industry-tree-toggle {
-         width: 100%%; height: 42px; min-height: 42px; display: flex; align-items: center;
-         text-align: left; padding: 10px 36px 10px 16px;
+      "/* Collapsible search/scroll dropdown (see www/tree_select.js), used
+          for Variable/Geography/Industry on Trends and for Industry on
+          Compare/Data -- toggle styled to csls.ca's own form-control spec
+          (42px tall, 8px radius, 14px/weight-300 text, rgba(0,0,0,.24)
+          hairline border, jets blue on hover/focus -- CSLS-Shiny-Style-Spec.md
+          section 4) so it reads as the same control family as every other
+          picker, selectize ones included. The toggle is a real text
+          <input> -- clicking or tabbing into it opens the panel and blanks
+          the box (rather than leaving the current label there to be
+          typed over) so you can search or scroll fresh, same as
+          selectize's own single-select behaviour; picking a row (or not)
+          is what shows/restores the display text, so there's no second
+          search box to style separately. Chevron is a plain
+          absolutely-positioned span next to the input (reusing
+          .trend-more-options' rotate-on-open technique above) rather than
+          an ::after pseudo-element -- browsers don't render generated
+          content on replaced elements like <input>. A childless row hides
+          its own arrow (.tree-select-row.no-children below) -- for
+          Industry's leaf rows that's visibility:hidden, keeping the blank
+          space so the label still lines up with sibling branch rows'
+          visible arrows one level up; a genuinely flat list (Variable/
+          Geography -- every row childless, no sibling ever has a visible
+          arrow to align against) instead collapses that gutter away
+          entirely via .tree-select-flat, so it doesn't read as a stray
+          indent in front of every label. */
+       .tree-select { position: relative; width: 100%%; }
+       .tree-select-toggle {
+         display: block; width: 100%%; height: 42px; min-height: 42px; margin: 0;
+         padding: 10px 36px 10px 16px;
          border: .5px solid rgba(0,0,0,.24); border-radius: 8px;
-         background-color: %s; color: %s; position: relative;
+         background-color: %s; color: %s;
          font-size: 14px; font-weight: 300; line-height: 1.4;
          transition: border-color 280ms ease;
        }
-       .industry-tree-toggle:hover, .industry-tree-toggle:focus-visible,
-       .industry-tree-toggle[aria-expanded=\"true\"] { border-color: %s; outline: 0; }
-       /* Placeholder text keys off the same muted token the site's own
-          .form-control::placeholder rule uses, rather than a hand-matched
-          native-input grey -- this is a plain <span>, not a real
-          placeholder attribute, so it doesn't get that colour for free the
-          way an <input> would. */
-       .industry-tree-toggle-label.industry-tree-empty { color: %s; }
-       .industry-tree-toggle::after {
-         content: '\\25B8'; position: absolute; right: 16px; top: 50%%;
+       /* Native placeholder attribute now that the toggle is a real
+          <input> -- keys off the same muted token the site's own
+          .form-control::placeholder rule uses. opacity:1 overrides
+          Firefox's default (0.54) so it matches other pickers exactly. */
+       .tree-select-toggle::placeholder { color: %s; opacity: 1; }
+       .tree-select-toggle:hover, .tree-select-toggle:focus,
+       .tree-select-toggle[aria-expanded=\"true\"] { border-color: %s; outline: 0; }
+       .tree-select-chevron {
+         position: absolute; right: 16px; top: 50%%; color: %s; pointer-events: none;
+         font-size: 14px; line-height: 1;
          transform: translateY(-50%%) rotate(90deg); transition: transform 0.15s ease;
        }
-       .industry-tree-toggle[aria-expanded=\"true\"]::after { transform: translateY(-50%%) rotate(-90deg); }
-       .industry-tree-panel {
+       .tree-select-toggle[aria-expanded=\"true\"] ~ .tree-select-chevron { transform: translateY(-50%%) rotate(-90deg); }
+       .tree-select-panel {
          position: absolute; z-index: 20; top: calc(100%% + 0.25rem); left: 0; width: 100%%;
          max-height: 320px; overflow-y: auto; background: %s; border: 0;
          border-radius: 8px; box-shadow: 0 14px 36px rgba(0,0,0,.16);
        }
-       .industry-tree-search {
-         position: sticky; top: 0; width: 100%%; padding: 10px 16px; box-sizing: border-box;
-         border: none; border-bottom: .5px solid %s; background: %s;
-         font-size: 14px; font-weight: 300;
-       }
-       .industry-tree-search:focus { outline: 0; border-bottom-color: %s; }
-       .industry-tree-list, .industry-tree-children { list-style: none; margin: 0; padding: 0; }
-       .industry-tree-row { display: flex; align-items: center; gap: 0.35rem; padding: 0.15rem 0.5rem; }
-       .industry-tree-arrow { cursor: pointer; transition: transform 0.15s ease; color: %s; width: 1em; text-align: center; }
-       .industry-tree-row.expanded > .industry-tree-arrow { transform: rotate(90deg); }
-       .industry-tree-row.no-children > .industry-tree-arrow { visibility: hidden; }
-       .industry-tree-label {
+       .tree-select-list, .tree-select-children { list-style: none; margin: 0; padding: 0; }
+       .tree-select-row { display: flex; align-items: center; gap: 0.35rem; padding: 0.15rem 0.5rem; }
+       .tree-select-arrow { cursor: pointer; transition: transform 0.15s ease; color: %s; width: 1em; text-align: center; }
+       .tree-select-row.expanded > .tree-select-arrow { transform: rotate(90deg); }
+       .tree-select-row.no-children > .tree-select-arrow { visibility: hidden; }
+       /* display:none, not visibility:hidden -- unlike a leaf row's own
+          arrow above, a flat list's arrow gutter isn't reserving space to
+          stay aligned with anything (there's no branch row anywhere in
+          it), so it should take up no room at all rather than a blank
+          1em + gap indent in front of every label. */
+       .tree-select-flat .tree-select-arrow { display: none; }
+       .tree-select-label {
          cursor: pointer; flex: 1 1 auto; padding: 10px 16px; border-radius: 4px;
          font-size: 14px; font-weight: 300; transition: background-color 280ms ease, color 280ms ease;
        }
@@ -2414,9 +2460,9 @@ ui <- function(request) {
           csls-shiny-theme.css): a jets-blue tint background with maple-blue
           text, not a solid fill -- for both the row being hovered and the
           one currently selected. */
-       .industry-tree-label:hover, .industry-tree-label:focus-visible,
-       .industry-tree-row.selected > .industry-tree-label { background: rgba(5,152,216,.1); color: %s; }
-       .industry-tree-node[hidden] { display: none; }
+       .tree-select-label:hover, .tree-select-label:focus-visible,
+       .tree-select-row.selected > .tree-select-label { background: rgba(5,152,216,.1); color: %s; }
+       .tree-select-node[hidden] { display: none; }
        /* Removable chip list for the Compare/Data 'Series to compare' list
           -- styled like csls.ca's own selectize multi-value chips
           (.selectize-control.multi .selectize-input > .item in
@@ -2436,18 +2482,17 @@ ui <- function(request) {
        }
        .pair-chip-remove:hover { background: rgba(5,152,216,.1); color: %s; }",
       CHART_SURFACE, INK_PRIMARY,
-      BRAND_JETS_BLUE,
       INK_MUTED,
-      CHART_SURFACE,
-      GRIDLINE, CHART_SURFACE,
       BRAND_JETS_BLUE,
+      INK_PRIMARY,
+      CHART_SURFACE,
       INK_MUTED,
       BRAND_MAPLE_BLUE,
       BRAND_MAPLE_BLUE,
       INK_MUTED,
       BRAND_JETS_BLUE
     ))),
-    tags$script(src = versioned_asset("industry_tree.js")),
+    tags$script(src = versioned_asset("tree_select.js")),
     tags$script(src = versioned_asset("ui_helpers.js")),
     p(
       class = "text-muted",
