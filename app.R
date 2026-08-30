@@ -686,7 +686,15 @@ industry_is_ancestor <- function(ancestor, industry) {
 # element trailing the whole tab region below the card.
 data_asof_ui <- function() {
   p(
-    class = "text-muted small",
+    # margin: 0 explicit -- this <p> sits one level inside its own
+    # uiOutput()'s wrapper div, itself now nested inside a further wrapper
+    # alongside the "Source" line (see trend_tab_ui() etc.) so the two read
+    # as one tight block. bslib's own gap-spacing CSS has a rule for
+    # exactly this shape (a <p> inside a directly-nested shiny-html-output)
+    # but only when that output div is a *direct* child of the fill column
+    # -- nested one level further than that, as it is now, it no longer
+    # matches, so this is set explicitly rather than depended on.
+    class = "text-muted small", style = "margin: 0;",
     "Data last refreshed: ", format(file.mtime(LP_DATA_FILE), "%Y-%m-%d")
   )
 }
@@ -748,6 +756,14 @@ trend_tab_ui <- function(id, init_df, variable_choices, geography_choices, indus
   ns <- NS(id)
 
   card(
+    # card-sidebar -- zeroes this card's own left padding (see the rule
+    # itself, alongside the nav-pills CSS) so the sidebar's tinted box sits
+    # flush with the card's true left edge instead of getting doubly inset
+    # by both the card's own padding AND the sidebar's -- that double-inset
+    # was what put the sidebar's visible edge ~40px to the right of the
+    # page's own left edge (the intro text/nav-pills), instead of aligned
+    # with it.
+    class = "card-sidebar",
     layout_sidebar(
       sidebar = sidebar(
         id = ns("sidebar"),
@@ -811,8 +827,29 @@ trend_tab_ui <- function(id, init_df, variable_choices, geography_choices, indus
         )
       ),
       plotlyOutput(ns("chart"), height = "100%"),
-      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01"),
-      uiOutput(ns("data_asof"))
+      # Grouped into one wrapper div, not two separate top-level children --
+      # bslib's own fill-layout puts a 24px `gap` between EVERY direct
+      # child of this flex column (chart / Source / data_asof), so as two
+      # siblings these read with the same 24px gap between them as between
+      # the chart and "Source" above -- one wrapper collapses that to a
+      # single gap (chart -> this pair), with the two lines themselves
+      # falling back to plain block stacking (0 margin on either <p>, so
+      # they sit immediately consecutive -- visually one paragraph, still
+      # two elements for data_asof_ui() to independently re-render into).
+      # The reclaimed 24px goes straight to the chart above, which is the
+      # only flex:1 (fill) child in this column.
+      tags$div(
+        # margin-bottom explicit here -- bslib's own `.bslib-gap-spacing > p
+        # { margin-bottom: 0 }` (what kept this flush before) only matches a
+        # *direct* child of the fill column; nested one level down inside
+        # this wrapper div, that rule no longer applies and this would
+        # otherwise fall back to Bootstrap's default 1rem <p> margin.
+        p(
+          class = "text-muted small", style = "margin-bottom: 0;",
+          "Source: Statistics Canada Table 36-10-0480-01"
+        ),
+        uiOutput(ns("data_asof"))
+      )
     )
   )
 }
@@ -1077,6 +1114,8 @@ ranking_tab_ui <- function(id, init_df, variable_choices, geography_choices) {
   ns <- NS(id)
 
   card(
+    # card-sidebar -- see the matching comment on the Trends tab's card().
+    class = "card-sidebar",
     layout_sidebar(
       sidebar = sidebar(
         id = ns("sidebar"),
@@ -1125,8 +1164,29 @@ ranking_tab_ui <- function(id, init_df, variable_choices, geography_choices) {
         )
       ),
       plotlyOutput(ns("chart"), height = "100%"),
-      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01"),
-      uiOutput(ns("data_asof"))
+      # Grouped into one wrapper div, not two separate top-level children --
+      # bslib's own fill-layout puts a 24px `gap` between EVERY direct
+      # child of this flex column (chart / Source / data_asof), so as two
+      # siblings these read with the same 24px gap between them as between
+      # the chart and "Source" above -- one wrapper collapses that to a
+      # single gap (chart -> this pair), with the two lines themselves
+      # falling back to plain block stacking (0 margin on either <p>, so
+      # they sit immediately consecutive -- visually one paragraph, still
+      # two elements for data_asof_ui() to independently re-render into).
+      # The reclaimed 24px goes straight to the chart above, which is the
+      # only flex:1 (fill) child in this column.
+      tags$div(
+        # margin-bottom explicit here -- bslib's own `.bslib-gap-spacing > p
+        # { margin-bottom: 0 }` (what kept this flush before) only matches a
+        # *direct* child of the fill column; nested one level down inside
+        # this wrapper div, that rule no longer applies and this would
+        # otherwise fall back to Bootstrap's default 1rem <p> margin.
+        p(
+          class = "text-muted small", style = "margin-bottom: 0;",
+          "Source: Statistics Canada Table 36-10-0480-01"
+        ),
+        uiOutput(ns("data_asof"))
+      )
     )
   )
 }
@@ -1344,7 +1404,10 @@ tab_module_ui <- function(id, init_df, kind, variable_choices, industry_tree) {
     # viewport-height budget every card is otherwise pinned to, which
     # silently clipped the Source/Data-last-refreshed lines after the table
     # instead of leaving them reachable by scrolling.
-    class = if (kind == "table") "table-tab-card",
+    # card-sidebar -- see the matching comment on the Trends tab's card();
+    # applies to both kinds sharing this module, alongside table-tab-card
+    # which only kind == "table" also needs.
+    class = paste(c("card-sidebar", if (kind == "table") "table-tab-card"), collapse = " "),
     layout_sidebar(
       sidebar = sidebar(
         id = ns("sidebar"),
@@ -1467,8 +1530,29 @@ tab_module_ui <- function(id, init_df, kind, variable_choices, industry_tree) {
         }
       ),
       main_panel,
-      p(class = "text-muted small", "Source: Statistics Canada Table 36-10-0480-01"),
-      uiOutput(ns("data_asof"))
+      # Grouped into one wrapper div, not two separate top-level children --
+      # bslib's own fill-layout puts a 24px `gap` between EVERY direct
+      # child of this flex column (chart / Source / data_asof), so as two
+      # siblings these read with the same 24px gap between them as between
+      # the chart and "Source" above -- one wrapper collapses that to a
+      # single gap (chart -> this pair), with the two lines themselves
+      # falling back to plain block stacking (0 margin on either <p>, so
+      # they sit immediately consecutive -- visually one paragraph, still
+      # two elements for data_asof_ui() to independently re-render into).
+      # The reclaimed 24px goes straight to the chart above, which is the
+      # only flex:1 (fill) child in this column.
+      tags$div(
+        # margin-bottom explicit here -- bslib's own `.bslib-gap-spacing > p
+        # { margin-bottom: 0 }` (what kept this flush before) only matches a
+        # *direct* child of the fill column; nested one level down inside
+        # this wrapper div, that rule no longer applies and this would
+        # otherwise fall back to Bootstrap's default 1rem <p> margin.
+        p(
+          class = "text-muted small", style = "margin-bottom: 0;",
+          "Source: Statistics Canada Table 36-10-0480-01"
+        ),
+        uiOutput(ns("data_asof"))
+      )
     )
   )
 }
@@ -2169,10 +2253,35 @@ ui <- function(request) {
        /* .card's own radius/padding/background come from csls-shiny-theme.css
           (section 8: 16px radius, 40px padding, white) -- no local override
           needed here now that that stylesheet is loaded (see tags$head()
-          above and the trailing tags$link() below). */
-       .nav-pills { margin-bottom: 1rem; }
+          above and the trailing tags$link() below). card-sidebar (added to
+          the Trends/Rankings/Compare/Data cards -- see trend_tab_ui() etc.)
+          overrides just the left side of that 40px padding down to 0: those
+          4 cards all wrap a layout_sidebar(), and the sidebar's own tinted
+          box was landing 40px right of the page's actual left edge (the
+          intro text/nav-pills below), double-inset by both the card's
+          padding and the sidebar's own -- zeroing the card's left padding
+          here lets the sidebar box sit flush with the card's true edge
+          (which already lines up with the page edge) instead. Every other
+          side of the card's padding (top/right/bottom) is untouched.
+          .card.card-sidebar (2 classes), not just .card-sidebar -- this
+          block is rendered before csls-shiny-theme.css's own .card padding
+          rule (that stylesheet is deliberately the LAST tag on the page --
+          see the tags$link() comment below), so a same-specificity
+          single-class rule here would lose that cascade tie (later same-
+          specificity source wins) even though it's the one meant to win;
+          the extra .card doubles this selector's specificity so it wins
+          regardless of source order. */
+       .card.card-sidebar { padding-left: 0; }
+       /* gap, not a per-link margin -- a margin on .nav-link put its own
+          0.5rem of whitespace on the *outside* ends of the row too (before
+          the first pill, after the last), so the row of buttons started
+          8px right of the page's actual left edge (the intro text just
+          above it). gap only ever sits *between* flex items (.nav-pills is
+          Bootstrap 5's .nav, already display:flex), so the same spacing
+          between pills no longer touches the row's own outer edges. */
+       .nav-pills { margin-bottom: 1rem; gap: 0.75rem; }
        .nav-pills .nav-link {
-         border: .5px solid rgba(0,0,0,.24); border-radius: 999px; margin: 0 0.5rem;
+         border: .5px solid rgba(0,0,0,.24); border-radius: 999px;
          color: %s; background-color: %s; font-weight: 400;
          transition: background-color 280ms ease, color 280ms ease, border-color 280ms ease;
        }
