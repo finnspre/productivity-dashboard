@@ -1938,13 +1938,22 @@ tab_module_server <- function(id, raw_data, kind) {
     styles <- reactive(series_style_map(active_pairs()$SeriesLabel))
 
     if (kind == "table") {
+      # server = FALSE (client-side paging): the 8-series comparison cap
+      # keeps this table small -- a few hundred rows at most -- so there's
+      # no real cost to rendering it whole. It also sidesteps DT's default
+      # server-side mode, whose page-change AJAX call back to this session
+      # is what throws "DataTables warning ... Ajax error" specifically
+      # when the app is iframe-embedded from Posit Connect Cloud (the
+      # proxied/cross-origin hop breaks that follow-up request even though
+      # the initial page load is fine); paging entirely client-side removes
+      # that round-trip.
       output$chart <- renderDT({
         df <- build_export_df(filtered_data(), input$rebase_toggle, input$base_year)
         datatable(
           df, rownames = FALSE, options = list(pageLength = 15),
           colnames = unname(export_column_labels(names(df), input$base_year, input$variable, variable_uom()))
         )
-      })
+      }, server = FALSE)
     } else {
       # kind == "bar" (the only other kind this shared module still serves)
       output$chart <- renderPlotly({
