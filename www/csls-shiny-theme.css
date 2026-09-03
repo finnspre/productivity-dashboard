@@ -892,16 +892,12 @@ table.dataTable tbody tr:hover td { background: rgba(5, 152, 216, .06); }
    close element in the DOM for every csls_notify() call -- it just fell
    back to raw Bootstrap grey with nothing here to style it, which is why
    it read as absent/easy to miss rather than an obvious "click to dismiss
-   early" control. */
+   early" control. Left plain on hover/click -- no colour-fill circle -- it
+   still dismisses the notification exactly as before, just without the
+   blue feedback bubble. */
 .shiny-notification-close {
   font-size: 1.4em;
   color: var(--color-dark-grey);
-  border-radius: 50%;
-  transition: background-color 280ms ease, color 280ms ease;
-}
-.shiny-notification-close:hover {
-  color: var(--color-white);
-  background-color: var(--color-jets-blue);
 }
 
 /* Shiny injects/removes this div itself on disconnect/reconnect -- it is
@@ -913,7 +909,7 @@ table.dataTable tbody tr:hover td { background: rgba(5, 152, 216, .06); }
    session$allowReconnect(TRUE) in app.R) can't help once the R process
    itself is actually gone -- a fresh page load always can. */
 #shiny-disconnected-overlay {
-  background: rgba(1, 47, 114, .92); /* --color-maple-blue at high alpha, not Shiny's flat grey */
+  background: rgba(1, 47, 114, .55); /* --color-maple-blue, translucent -- signals "reload needed" without blacking out the app underneath */
   opacity: 1;
   display: flex;
   align-items: center;
