@@ -107,6 +107,17 @@ VARIABLE_ORDER <- c(
 DEFAULT_INDUSTRY_LEVEL <- "Aggregate"
 INDUSTRY_LEVEL_ORDER <- c("Aggregate", "2-digit", "3-digit")
 
+# Rankings tab: row count above which the chart switches from a single
+# fixed-height, one-side-labelled layout to a taller, scrollable one with
+# labels split across both sides (see ranking_tab_server()'s output$chart
+# and output$chart_container). In practice only "Sub-sector level" (up to
+# ~139 rows -- 3 Aggregate + 25 2-digit + 111 3-digit industries in the
+# real data) crosses this; Aggregate (3 rows) and Sector level (~28 rows)
+# stay comfortably under it and keep today's exact appearance.
+RANKING_CHART_ROW_THRESHOLD <- 40
+RANKING_CHART_PX_PER_ROW <- 28
+RANKING_CHART_TICKFONT_SPLIT <- 10
+
 # Plain-language explanation shown below the main panel for the currently
 # selected variable. "Total number of jobs" maps to "" since it needs no
 # explanation -- renderUI treats an empty/missing entry as "show nothing".
@@ -1132,7 +1143,11 @@ ranking_tab_ui <- function(id, init_df, variable_choices, geography_choices) {
 
   card(
     # card-sidebar -- see the matching comment on the Trends tab's card().
-    class = "card-sidebar",
+    # ranking-tab-card mirrors the Data tab's table-tab-card (see
+    # tab_module_ui()/its matching CSS): a no-op on its own, it only lets
+    # this card scroll instead of clip once output$chart_container below
+    # switches the chart to a real, content-driven pixel height.
+    class = "card-sidebar ranking-tab-card",
     layout_sidebar(
       sidebar = sidebar(
         id = ns("sidebar"),
@@ -1182,7 +1197,14 @@ ranking_tab_ui <- function(id, init_df, variable_choices, geography_choices) {
           download_menu_ui(ns)
         )
       ),
-      plotlyOutput(ns("chart"), height = "100%"),
+      # The actual plotlyOutput lives in output$chart_container (renderUI)
+      # server-side instead of statically here -- once there are more
+      # industries than fit on one screen (see RANKING_CHART_ROW_THRESHOLD),
+      # it needs a real, content-driven pixel height instead of the usual
+      # height="100%" fill, so the card above can scroll to it rather than
+      # clipping it. Below that threshold it renders the exact same
+      # plotlyOutput(height="100%") this replaces.
+      uiOutput(ns("chart_container"), fill = TRUE),
       # Grouped into one wrapper div, not two separate top-level children --
       # bslib's own fill-layout puts a 24px `gap` between EVERY direct
       # child of this flex column (chart / Source / data_asof), so as two
@@ -1310,8 +1332,50 @@ ranking_tab_server <- function(id, raw_data) {
       }
     })
 
-    output$chart <- renderPlotly({
+    # Shared by output$chart_container (which needs just the row count, to
+    # decide how tall the chart should be) and output$chart (which needs
+    # the actual data) -- factored out so both agree on exactly the same
+    # rows, instead of the row count and the rendered chart risking drift
+    # from two separately-filtered copies.
+    ranking_chart_data <- reactive({
       rd <- ranking_data() %>% filter(!is.na(CAGR)) %>% arrange(CAGR)
+      rd$Industry <- factor(rd$Industry, levels = rd$Industry)
+      rd
+    })
+
+    # tryCatch mirrors ranking_dropped_industries() above -- ranking_data()
+    # can itself be mid-validate() (e.g. "No data for this variable/
+    # geography combination", a time frame spanning under 2 years), and
+    # that condition would otherwise propagate straight through here into
+    # output$chart_container's own renderUI, replacing the plotlyOutput it
+    # builds with a validation message of its own -- which would leave
+    # output$chart with no output element left to render its more specific
+    # "No industries have data..." message into. Falling back to 0 rows
+    # instead just keeps the chart at its normal one-screen size, exactly
+    # as if nothing were selected -- output$chart's own validate() below
+    # still fires and shows the real message once it renders into that.
+    ranking_chart_row_count <- reactive({
+      tryCatch(nrow(ranking_chart_data()), error = function(e) 0L)
+    })
+
+    output$chart_container <- renderUI({
+      n <- ranking_chart_row_count()
+      if (n > RANKING_CHART_ROW_THRESHOLD) {
+        # fill = FALSE -- a real, content-driven pixel height instead of
+        # the usual 100%-of-card fill, so ranking-tab-card's own
+        # overflow-y: auto (see the CSS below) can scroll to the rest of
+        # it instead of clipping/squeezing every row into one screen.
+        plotlyOutput(session$ns("chart"), height = paste0(n * RANKING_CHART_PX_PER_ROW, "px"), fill = FALSE)
+      } else {
+        # Today's exact behaviour, byte-for-byte, whenever there aren't
+        # enough rows for that to be worth doing (in practice: Aggregate
+        # and Sector level, ~3 and ~28 rows respectively).
+        plotlyOutput(session$ns("chart"), height = "100%", fill = TRUE)
+      }
+    })
+
+    output$chart <- renderPlotly({
+      rd <- ranking_chart_data()
       # Distinct from ranking_data()'s own validate() -- rows can exist
       # there but still end up all-NA CAGR here (every matched industry
       # lacks a value at the start or end year, or has a 0 start value).
@@ -1320,7 +1384,12 @@ ranking_tab_server <- function(id, raw_data) {
         nrow(rd) > 0,
         "No industries have data at both the start and end of the selected time frame -- pick a different range."
       ))
-      rd$Industry <- factor(rd$Industry, levels = rd$Industry)
+      n <- nrow(rd)
+      # Mirrors output$chart_container's own threshold check -- both need
+      # to agree on whether this render is "too many rows for one side at
+      # normal size" (see RANKING_CHART_ROW_THRESHOLD's own comment for
+      # why 40, and why in practice only Sub-sector level crosses it).
+      split_mode <- n > RANKING_CHART_ROW_THRESHOLD
 
       # Same ranked CAGR data either way -- scatter (one point per industry,
       # no bar length) reads better once the 3-digit level pulls in 100+
@@ -1342,16 +1411,74 @@ ranking_tab_server <- function(id, raw_data) {
         )
       }
 
-      p %>% layout(
+      # Below the threshold, this is exactly today's single left-side axis
+      # at normal size. Above it, industries alternate by rank parity onto
+      # a left axis (odd ranks) and a right axis (even ranks) -- alternating
+      # rather than splitting top-half/bottom-half, because *adjacent* bars
+      # are always exactly 1 row apart either way; only alternating actually
+      # doubles the vertical room each side's own labels get, uniformly
+      # across the whole list.
+      if (split_mode) {
+        levels_all <- levels(rd$Industry)
+        rank <- seq_along(levels_all)
+        left_labels <- levels_all[rank %% 2 == 1]
+        right_labels <- levels_all[rank %% 2 == 0]
+        axis_range <- c(-0.5, n - 0.5) # plotly's own default category-axis padding
+        yaxis_left <- list(
+          title = "", type = "category",
+          categoryorder = "array", categoryarray = levels_all,
+          tickmode = "array", tickvals = left_labels, ticktext = left_labels,
+          range = axis_range, automargin = TRUE,
+          gridcolor = GRIDLINE, color = INK_MUTED,
+          tickfont = list(size = RANKING_CHART_TICKFONT_SPLIT)
+        )
+      } else {
+        yaxis_left <- list(title = "", gridcolor = GRIDLINE, color = INK_MUTED)
+      }
+
+      p <- p %>% layout(
         title = paste0(
           input$variable, " by industry — ", input$geography,
           " (", input$year_range[1], "-", input$year_range[2], ")"
         ),
         xaxis = list(title = "Compound annual growth rate (%)", gridcolor = GRIDLINE, color = INK_MUTED),
-        yaxis = list(title = "", gridcolor = GRIDLINE, color = INK_MUTED),
+        yaxis = yaxis_left,
         paper_bgcolor = CHART_SURFACE, plot_bgcolor = CHART_SURFACE,
         font = list(color = INK_PRIMARY, family = FONT_FAMILY)
       )
+
+      if (split_mode) {
+        # Plotly.js only actually draws (and reserves automargin space
+        # for) a y-axis that has at least one trace bound to it -- a bare
+        # layout(yaxis2 = ...) with no trace ever assigned yaxis = "y2" is
+        # silently never rendered at all, confirmed against the live app
+        # (0 tick-label DOM nodes despite automargin = TRUE). This
+        # invisible dummy trace exists purely to make yaxis2 real: NA x
+        # values draw nothing, marker opacity 0/hoverinfo "skip"/
+        # showlegend FALSE keep it from being seen, hovered, or listed.
+        # inherit = FALSE stops it picking up the real trace's x/y/type
+        # mapping from the original plot_ly() call above.
+        p <- p %>% add_markers(
+          data = data.frame(Industry = rd$Industry),
+          x = NA_real_, y = ~Industry, yaxis = "y2",
+          marker = list(opacity = 0), hoverinfo = "skip", showlegend = FALSE,
+          inherit = FALSE
+        )
+        # type and range are repeated here to match yaxis_left exactly --
+        # yaxis2 otherwise has nothing else to infer either from, and
+        # needs to line its rows up with where the primary axis actually
+        # drew each bar. showgrid = FALSE avoids doubled gridlines from
+        # the overlay.
+        p <- p %>% layout(yaxis2 = list(
+          overlaying = "y", side = "right", type = "category",
+          categoryorder = "array", categoryarray = levels(rd$Industry),
+          tickmode = "array", tickvals = right_labels, ticktext = right_labels,
+          range = axis_range, automargin = TRUE,
+          showgrid = FALSE, color = INK_MUTED,
+          tickfont = list(size = RANKING_CHART_TICKFONT_SPLIT)
+        ))
+      }
+      p
     })
 
     output$variable_definition <- renderUI({
@@ -2401,19 +2528,27 @@ ui <- function(request) {
     # each remaining sprintf() call comfortably under that limit.
     tags$style(HTML(
       "/* page_fillable() pins the whole page to viewport height with no
-          page-level scrolling (by design, so Trends/Rankings/Compare's
-          Plotly charts fill exactly one screen) -- fine for a chart sized
-          to fill 100% of its card, but a DT table's true height (rows plus
-          its own Showing-X-of-Y/pagination footer) is content-driven and
-          routinely exceeds that fixed budget. Without this, anything past
-          the budget was silently clipped, which is what made the Source/
-          Data-last-refreshed lines after the table disappear or overlap
-          DT's own footer instead of just being scrolled to. Scoped to just
-          the Data tab's card (see class = if (kind == table) ... in
-          tab_module_ui()) -- Trends/Rankings/Compare keep the plain
-          clipped-to-viewport behavior, which is what makes their charts
-          fill height instead of pushing the page taller. */
+          page-level scrolling (by design, so Trends/Compare's Plotly
+          charts fill exactly one screen) -- fine for a chart sized to fill
+          100% of its card, but a DT table's true height (rows plus its own
+          Showing-X-of-Y/pagination footer) is content-driven and routinely
+          exceeds that fixed budget. Without this, anything past the budget
+          was silently clipped, which is what made the Source/Data-last-
+          refreshed lines after the table disappear or overlap DT's own
+          footer instead of just being scrolled to. Scoped to just the Data
+          tab's card (see class = if (kind == table) ... in
+          tab_module_ui()) -- Trends/Compare keep the plain clipped-to-
+          viewport behavior, which is what makes their charts fill height
+          instead of pushing the page taller. */
        .tab-pane.active > .card.table-tab-card { overflow-y: auto; }
+       /* Same mechanism, for the Rankings tab (see ranking_tab_ui()'s
+          ranking-tab-card class and ranking_tab_server()'s
+          output$chart_container) -- a no-op whenever that chart is small
+          enough to just fill the card at its normal height=100%, and only
+          produces a real scrollbar once there are more industries than fit
+          on one screen, so every one of them stays fully legible instead
+          of being squeezed/clipped into a fixed budget. */
+       .tab-pane.active > .card.ranking-tab-card { overflow-y: auto; }
        /* Every tab's Download dropdown (see download_menu_ui()) -- full
           width so the toggle button lines up with the other sidebar
           controls above it instead of sizing to its own label. */
