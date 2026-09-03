@@ -909,7 +909,7 @@ table.dataTable tbody tr:hover td { background: rgba(5, 152, 216, .06); }
    session$allowReconnect(TRUE) in app.R) can't help once the R process
    itself is actually gone -- a fresh page load always can. */
 #shiny-disconnected-overlay {
-  background: rgba(1, 47, 114, .55); /* --color-maple-blue, translucent -- signals "reload needed" without blacking out the app underneath */
+  background: rgba(5, 152, 216, .30); /* --color-jets-blue, translucent -- signals "reload needed" without blacking out the app underneath */
   opacity: 1;
   display: flex;
   align-items: center;
