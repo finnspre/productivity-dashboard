@@ -2287,7 +2287,29 @@ ui <- function(request) {
     # our light grey/white palette into a dark one on its own.
     tags$style(HTML(sprintf(
       "html { color-scheme: light; }
-       body { padding: 2rem 2.5rem; background-color: %s; font-family: %s; color: %s; }
+       /* This body{padding:...} rule's own padding half never actually
+          applied -- page_fillable() puts a real class, .bslib-page-fill,
+          on <body> itself, and that bslib stylesheet's own
+          `padding: var(--bslib-spacer, 1rem)` rule (a single-class
+          selector, specificity 0,1,0) beats a bare `body` element
+          selector (0,0,1) regardless of which stylesheet loads later --
+          confirmed against the live page via CDP's getMatchedStylesForNode,
+          which shows bslib's rule as the one actually winning. Every
+          margin the rest of this page was ever visually tuned against
+          (sidebar/card left edge, etc.) was tuned against THAT padding
+          (a uniform ~24px on all four sides), not the 32px/40px this line
+          appears to ask for -- so left/right are deliberately left alone
+          below (re-specifying them here would be the actual behaviour
+          change); only the redundant bottom inset is trimmed, via the
+          higher-specificity body.bslib-page-fill override right after
+          this rule, to let the sidebar/chart card reach closer to the
+          bottom of the page as requested. */
+       body { background-color: %s; font-family: %s; color: %s; }
+       /* See the comment above -- this narrowly out-specifies bslib's own
+          .bslib-page-fill padding rule for just padding-bottom (the
+          property this selector sets), while padding-top/left/right fall
+          through unchanged to bslib's rule exactly as they already did. */
+       body.bslib-page-fill { padding-bottom: 12px; }
        /* .card's own radius/padding/background come from csls-shiny-theme.css
           (section 8: 16px radius, 40px padding, white) -- no local override
           needed here now that that stylesheet is loaded (see tags$head()
@@ -2342,19 +2364,28 @@ ui <- function(request) {
        .trend-more-options > summary::before { content: '\\25B8'; transition: transform 0.15s ease; }
        .trend-more-options[open] > summary::before { transform: rotate(90deg); }
        /* page_fillable() makes <body> a fill-height flex column, but
-          navset_pill()'s .tabbable/.tab-content/.tab-pane wrapper markup
-          is all plain block, none of it a flex container passing that
-          fill height further down -- without these three, the card
-          (which bslib DOES mark fill-aware) never receives a stretched
-          height to fill. */
-       .tabbable { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+          navset_pill()'s own .tab-content/.tab-pane wrapper markup is all
+          plain block, none of it a flex container passing that fill
+          height further down -- without these, the card (which bslib DOES
+          mark fill-aware) never receives a stretched height to fill.
+          .tab-content sits directly under <body> now (see the ul.nav/
+          .tab-content split just above, pulled apart so the logo can sit
+          beside just the nav-pills row) rather than nested inside
+          navset_pill()'s own .tabbable wrapper div, so flex:1 1 auto on
+          .tab-content alone is what grows it to fill the remaining body
+          height -- no .tabbable rule needed any more. */
        .tab-content { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
        .tab-content > .tab-pane.active { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
        /* bslib's own .card.html-fill-item CSS defaults to flex: 0 1 auto
           (content-sized, not growing) -- override just the one directly
           inside our now-fillable tab pane so it actually claims the space
-          the layers above are now correctly offering it. */
-       .tab-pane.active > .card { flex: 1 1 auto; min-height: 0; }",
+          the layers above are now correctly offering it. margin-bottom: 0
+          strips a stray ~24px bslib puts below every .card by default --
+          on most pages that's a gap before the *next* section, but this
+          card is the last thing on the page, so it was just dead space
+          between the sidebar/chart and the bottom edge for no visual
+          purpose. */
+       .tab-pane.active > .card { flex: 1 1 auto; min-height: 0; margin-bottom: 0; }",
       CHART_SURFACE, FONT_FAMILY, INK_PRIMARY,
       BRAND_MAPLE_BLUE, CHART_SURFACE,
       BRAND_JETS_BLUE, BRAND_JETS_BLUE,
@@ -2503,31 +2534,74 @@ ui <- function(request) {
     ))),
     tags$script(src = versioned_asset("tree_select.js")),
     tags$script(src = versioned_asset("ui_helpers.js")),
-    p(
-      class = "text-muted",
-      style = "margin-bottom: 0.75rem;",
-      "Use this data dashboard to explore labour productivity trends across Canadian industries ",
-      "using Statistics Canada data. Compare industries over time, examine recent growth and ",
-      "customized subperiods, rank long-run performance, and download underlying data."
-    ),
+    # Logo, left of the nav-pills row (no on-page title text anymore -- the
+    # page(title=...) string above is only ever the *browser tab* title).
+    # app-header-row has no horizontal margin/padding of its own, so it
+    # inherits the page's left edge from <body>'s own padding (see the body
+    # rules above) -- the logo lines up flush-left with the card/sidebar
+    # edge below it, same as every other top-level element on this page.
+    # The nav-pills row is pulled into that same flex row via flex:1, so
+    # the pills now fill the width remaining *after* the logo + gap instead
+    # of the full page width -- justified/equal-width across that narrower
+    # space, shifted right just enough to leave the logo room.
+    #
+    # No margin-bottom of its own on app-header-row -- page_fillable()'s
+    # own body already puts a structural `gap` between every direct child
+    # (confirmed via getMatchedStylesForNode: body picks up
+    # .bslib-page-fill's `gap: var(--bslib-spacer, 1rem)`), so an explicit
+    # margin here was pure double-spacing on top of that, stacking with it
+    # to push the card further from the buttons than intended. margin-top
+    # nudges the logo/buttons down slightly from the page's own top edge
+    # (independent of that structural gap, which sits *after* this row).
+    # tab-content's small negative margin-top pulls the card up into part
+    # of that same structural gap, tightening the row-to-card space a
+    # little without touching --bslib-spacer itself (which also governs
+    # the chart-to-Source-line gap inside the card, left alone).
+    #
     # navset_pill (button-styled tabs) + nav-justified (stretched to fill
-    # the page width in equal-width segments) instead of the default
+    # the available width in equal-width segments) instead of the default
     # left-aligned, content-width nav-tabs underline style.
     #
     # Depends on bslib's internal navset_pill() markup exposing a
-    # "ul.nav" element to target -- if a future bslib version restructures
-    # that, find() just matches nothing and addClass() is then a no-op
-    # (verified: this degrades to un-justified tabs, it does not error or
-    # break tab switching), so a bslib upgrade is a "check this still looks
-    # right" item, not a "the app is broken" risk.
-    tagQuery(
-      navset_pill(
-        nav_panel("Trends", trend_tab_ui("trend", init_df, variable_choices, geography_choices, industry_tree)),
-        nav_panel("Rankings", ranking_tab_ui("ranking", init_df, variable_choices, geography_choices)),
-        nav_panel("Compare", tab_module_ui("bar", init_df, "bar", variable_choices, industry_tree)),
-        nav_panel("Data", tab_module_ui("table", init_df, "table", variable_choices, industry_tree))
+    # "ul.nav"/".tab-content" pair to split apart -- if a future bslib
+    # version restructures that, find() just matches nothing and
+    # selectedTags() then returns an empty list (verified: this drops the
+    # tabs/content entirely rather than erroring), so a bslib upgrade is a
+    # "check this still renders" item, not a silent breakage risk.
+    tags$style(HTML(
+      ".app-header-row { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem; }
+       /* Wide logo (icon + wordmark, ~3.46:1) -- height fixed to match the
+          nav-pills row, width left auto so it scales at its own natural
+          aspect ratio instead of being squashed into the old square 40px
+          icon box. */
+       .app-header-logo { height: 52px; width: auto; flex-shrink: 0; }
+       .app-header-row .nav-pills { flex: 1 1 auto; margin-bottom: 0; }
+       .tab-content { margin-top: -1rem; }"
+    )),
+    (function() {
+      navset <- tagQuery(
+        navset_pill(
+          nav_panel("Trends", trend_tab_ui("trend", init_df, variable_choices, geography_choices, industry_tree)),
+          nav_panel("Rankings", ranking_tab_ui("ranking", init_df, variable_choices, geography_choices)),
+          nav_panel("Compare", tab_module_ui("bar", init_df, "bar", variable_choices, industry_tree)),
+          nav_panel("Data", tab_module_ui("table", init_df, "table", variable_choices, industry_tree))
+        )
       )
-    )$find("ul.nav")$addClass("nav-justified")$allTags(),
+      nav_ul <- navset$find("ul.nav")$addClass("nav-justified")$selectedTags()
+      tab_content <- navset$find(".tab-content")$selectedTags()
+      tagList(
+        tags$div(
+          class = "app-header-row",
+          tags$img(
+            src = versioned_asset("csls-logo-wide.png"),
+            alt = "Centre for the Study of Living Standards",
+            class = "app-header-logo"
+          ),
+          nav_ul
+        ),
+        tab_content
+      )
+    })(),
     # csls-shiny-theme.css (www/) is the drop-in stylesheet that makes every
     # Bootstrap control -- inputs, selects, checkboxes/radios, buttons, the
     # DT table, the ionRangeSlider year picker -- match csls.ca's own
