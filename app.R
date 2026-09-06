@@ -157,6 +157,16 @@ VARIABLE_DEFINITIONS <- c(
   "Labour share" = "The ratio of total compensation as a percentage of the nominal value added."
 )
 
+# Plain-language explanation for the currently selected Variable, shown
+# below the picker on all 4 tabs (each just does
+# `output$variable_definition <- renderUI(variable_definition_ui(input$variable))`)
+# -- factored out so the 4 copies of this logic can't drift.
+variable_definition_ui <- function(variable) {
+  def <- VARIABLE_DEFINITIONS[[variable]]
+  if (is.null(def) || !nzchar(def)) return(NULL)
+  p(class = "text-muted small", strong(paste0(variable, ": ")), def)
+}
+
 # Levels up to and including `level` -- e.g. "2-digit" resolves to
 # c("Aggregate", "2-digit"), so picking a detail level always keeps the
 # coarser rows too rather than switching to only that one level.
@@ -772,6 +782,33 @@ data_asof_ui <- function() {
   )
 }
 
+# The "Source: Statistics Canada Table ..." + data_asof_ui() footer pair
+# shared by all 4 tabs, immediately below their chart/table. Grouped into
+# one wrapper div, not two separate top-level children -- bslib's own
+# fill-layout puts a 24px `gap` between EVERY direct child of the fill
+# column (chart / Source / data_asof), so as two siblings these would read
+# with the same 24px gap between them as between the chart and "Source"
+# above; one wrapper collapses that to a single gap (chart -> this pair),
+# with the two lines themselves falling back to plain block stacking (0
+# margin on either <p>, so they sit immediately consecutive -- visually one
+# paragraph, still two elements for data_asof_ui() to independently
+# re-render into). The reclaimed 24px goes straight to the chart above,
+# which is the only flex:1 (fill) child in this column.
+source_and_asof_ui <- function(ns) {
+  tags$div(
+    # margin-bottom explicit here -- bslib's own `.bslib-gap-spacing > p
+    # { margin-bottom: 0 }` (what kept this flush before) only matches a
+    # *direct* child of the fill column; nested one level down inside this
+    # wrapper div, that rule no longer applies and this would otherwise
+    # fall back to Bootstrap's default 1rem <p> margin.
+    p(
+      class = "text-muted small", style = "margin-bottom: 0;",
+      paste0("Source: Statistics Canada Table ", STATCAN_TABLE_ID)
+    ),
+    uiOutput(ns("data_asof"))
+  )
+}
+
 # Shared "Download" dropdown for the Trends, Rankings, Compare, and Data
 # tabs -- replaces each tab's old single-purpose "Download CSV" button with
 # a menu tailored to what that tab can actually offer:
@@ -905,34 +942,14 @@ trend_tab_ui <- function(id, init_df, variable_choices, geography_choices, indus
         )
       ),
       plotlyOutput(ns("chart"), height = "100%"),
-      # Grouped into one wrapper div, not two separate top-level children --
-      # bslib's own fill-layout puts a 24px `gap` between EVERY direct
-      # child of this flex column (chart / Source / data_asof), so as two
-      # siblings these read with the same 24px gap between them as between
-      # the chart and "Source" above -- one wrapper collapses that to a
-      # single gap (chart -> this pair), with the two lines themselves
-      # falling back to plain block stacking (0 margin on either <p>, so
-      # they sit immediately consecutive -- visually one paragraph, still
-      # two elements for data_asof_ui() to independently re-render into).
-      # The reclaimed 24px goes straight to the chart above, which is the
-      # only flex:1 (fill) child in this column.
-      tags$div(
-        # margin-bottom explicit here -- bslib's own `.bslib-gap-spacing > p
-        # { margin-bottom: 0 }` (what kept this flush before) only matches a
-        # *direct* child of the fill column; nested one level down inside
-        # this wrapper div, that rule no longer applies and this would
-        # otherwise fall back to Bootstrap's default 1rem <p> margin.
-        p(
-          class = "text-muted small", style = "margin-bottom: 0;",
-          paste0("Source: Statistics Canada Table ", STATCAN_TABLE_ID)
-        ),
-        uiOutput(ns("data_asof"))
-      )
+      # See source_and_asof_ui()'s own comment for why this is one wrapper
+      # div rather than two separate top-level children here.
+      source_and_asof_ui(ns)
     )
   )
 }
 
-trend_tab_server <- function(id, raw_data) {
+trend_tab_server <- function(id, raw_data, variable_uom_lookup) {
   moduleServer(id, function(input, output, session) {
 
     # Keeps Variable/Geography/Industry/time-frame/base-year in sync with
@@ -1012,9 +1029,13 @@ trend_tab_server <- function(id, raw_data) {
         mutate(SeriesLabel = pair_label(input$industry, input$geography))
     })
 
+    # UOM is 1:1 per Variable (see variable_uom_lookup() in server(), shared
+    # across all 4 tabs) -- a small lookup keyed by Variable, not a fresh
+    # filter() over the full (~588k-row) raw_data() every time this tab's
+    # Variable picker changes.
     variable_uom <- reactive({
-      vals <- raw_data() %>% filter(Variable == input$variable) %>% pull(UOM)
-      vals[1]
+      lookup <- variable_uom_lookup()
+      lookup$UOM[lookup$Variable == input$variable][1]
     })
 
     history_with_growth <- reactive({
@@ -1141,11 +1162,7 @@ trend_tab_server <- function(id, raw_data) {
         )
     })
 
-    output$variable_definition <- renderUI({
-      def <- VARIABLE_DEFINITIONS[[input$variable]]
-      if (is.null(def) || !nzchar(def)) return(NULL)
-      p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
-    })
+    output$variable_definition <- renderUI(variable_definition_ui(input$variable))
 
     # raw_data() is the dependency, not the value used -- reading it just
     # ties this to the same reactiveFileReader invalidation as this tab's
@@ -1255,34 +1272,14 @@ ranking_tab_ui <- function(id, init_df, variable_choices, geography_choices) {
       # clipping it. Below that threshold it renders the exact same
       # plotlyOutput(height="100%") this replaces.
       uiOutput(ns("chart_container"), fill = TRUE),
-      # Grouped into one wrapper div, not two separate top-level children --
-      # bslib's own fill-layout puts a 24px `gap` between EVERY direct
-      # child of this flex column (chart / Source / data_asof), so as two
-      # siblings these read with the same 24px gap between them as between
-      # the chart and "Source" above -- one wrapper collapses that to a
-      # single gap (chart -> this pair), with the two lines themselves
-      # falling back to plain block stacking (0 margin on either <p>, so
-      # they sit immediately consecutive -- visually one paragraph, still
-      # two elements for data_asof_ui() to independently re-render into).
-      # The reclaimed 24px goes straight to the chart above, which is the
-      # only flex:1 (fill) child in this column.
-      tags$div(
-        # margin-bottom explicit here -- bslib's own `.bslib-gap-spacing > p
-        # { margin-bottom: 0 }` (what kept this flush before) only matches a
-        # *direct* child of the fill column; nested one level down inside
-        # this wrapper div, that rule no longer applies and this would
-        # otherwise fall back to Bootstrap's default 1rem <p> margin.
-        p(
-          class = "text-muted small", style = "margin-bottom: 0;",
-          paste0("Source: Statistics Canada Table ", STATCAN_TABLE_ID)
-        ),
-        uiOutput(ns("data_asof"))
-      )
+      # See source_and_asof_ui()'s own comment for why this is one wrapper
+      # div rather than two separate top-level children here.
+      source_and_asof_ui(ns)
     )
   )
 }
 
-ranking_tab_server <- function(id, raw_data) {
+ranking_tab_server <- function(id, raw_data, variable_uom_lookup) {
   moduleServer(id, function(input, output, session) {
 
     # Same DEFAULT_*-fallback sync pattern as the Trends tab -- Variable and
@@ -1333,9 +1330,13 @@ ranking_tab_server <- function(id, raw_data) {
         )
     })
 
+    # UOM is 1:1 per Variable (see variable_uom_lookup() in server(), shared
+    # across all 4 tabs) -- a small lookup keyed by Variable, not a fresh
+    # filter() over the full (~588k-row) raw_data() every time this tab's
+    # Variable picker changes.
     variable_uom <- reactive({
-      vals <- raw_data() %>% filter(Variable == input$variable) %>% pull(UOM)
-      vals[1]
+      lookup <- variable_uom_lookup()
+      lookup$UOM[lookup$Variable == input$variable][1]
     })
 
     # CAGR from the start to the end of the selected time frame.
@@ -1531,11 +1532,7 @@ ranking_tab_server <- function(id, raw_data) {
       p
     })
 
-    output$variable_definition <- renderUI({
-      def <- VARIABLE_DEFINITIONS[[input$variable]]
-      if (is.null(def) || !nzchar(def)) return(NULL)
-      p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
-    })
+    output$variable_definition <- renderUI(variable_definition_ui(input$variable))
 
     # raw_data() is the dependency, not the value used -- reading it just
     # ties this to the same reactiveFileReader invalidation as this tab's
@@ -1735,29 +1732,9 @@ tab_module_ui <- function(id, init_df, kind, variable_choices, industry_tree) {
         }
       ),
       main_panel,
-      # Grouped into one wrapper div, not two separate top-level children --
-      # bslib's own fill-layout puts a 24px `gap` between EVERY direct
-      # child of this flex column (chart / Source / data_asof), so as two
-      # siblings these read with the same 24px gap between them as between
-      # the chart and "Source" above -- one wrapper collapses that to a
-      # single gap (chart -> this pair), with the two lines themselves
-      # falling back to plain block stacking (0 margin on either <p>, so
-      # they sit immediately consecutive -- visually one paragraph, still
-      # two elements for data_asof_ui() to independently re-render into).
-      # The reclaimed 24px goes straight to the chart above, which is the
-      # only flex:1 (fill) child in this column.
-      tags$div(
-        # margin-bottom explicit here -- bslib's own `.bslib-gap-spacing > p
-        # { margin-bottom: 0 }` (what kept this flush before) only matches a
-        # *direct* child of the fill column; nested one level down inside
-        # this wrapper div, that rule no longer applies and this would
-        # otherwise fall back to Bootstrap's default 1rem <p> margin.
-        p(
-          class = "text-muted small", style = "margin-bottom: 0;",
-          paste0("Source: Statistics Canada Table ", STATCAN_TABLE_ID)
-        ),
-        uiOutput(ns("data_asof"))
-      )
+      # See source_and_asof_ui()'s own comment for why this is one wrapper
+      # div rather than two separate top-level children here.
+      source_and_asof_ui(ns)
     )
   )
 }
@@ -1768,7 +1745,7 @@ tab_module_ui <- function(id, init_df, kind, variable_choices, industry_tree) {
 # Variable/Compare/Display selections are fully independent -- module
 # namespacing (see tab_module_ui) is what makes multiple simultaneous
 # copies of the same widget ids possible in one page.
-tab_module_server <- function(id, raw_data, kind) {
+tab_module_server <- function(id, raw_data, kind, variable_uom_lookup) {
   moduleServer(id, function(input, output, session) {
 
     # Keeps the variable, geography, time frame, and base year selectors in
@@ -2016,9 +1993,13 @@ tab_module_server <- function(id, raw_data, kind) {
 
     selected_series <- reactive(active_pairs()$SeriesLabel)
 
+    # UOM is 1:1 per Variable (see variable_uom_lookup() in server(), shared
+    # across all 4 tabs) -- a small lookup keyed by Variable, not a fresh
+    # filter() over the full (~588k-row) raw_data() every time this tab's
+    # Variable picker changes.
     variable_uom <- reactive({
-      vals <- raw_data() %>% filter(Variable == input$variable) %>% pull(UOM)
-      vals[1]
+      lookup <- variable_uom_lookup()
+      lookup$UOM[lookup$Variable == input$variable][1]
     })
 
     # Full history (not yet limited to the time-frame slider) for the
@@ -2237,11 +2218,7 @@ tab_module_server <- function(id, raw_data, kind) {
       })
     }
 
-    output$variable_definition <- renderUI({
-      def <- VARIABLE_DEFINITIONS[[input$variable]]
-      if (is.null(def) || !nzchar(def)) return(NULL)
-      p(class = "text-muted small", strong(paste0(input$variable, ": ")), def)
-    })
+    output$variable_definition <- renderUI(variable_definition_ui(input$variable))
 
     # raw_data() is the dependency, not the value used -- reading it just
     # ties this to the same reactiveFileReader invalidation as this tab's
@@ -2821,10 +2798,17 @@ server <- function(input, output, session) {
 
   raw_data <- RAW_DATA_READER # single shared reactiveFileReader, not duplicated per tab
 
-  trend_tab_server("trend", raw_data)
-  ranking_tab_server("ranking", raw_data)
-  tab_module_server("bar", raw_data, "bar")
-  tab_module_server("table", raw_data, "table")
+  # UOM is 1:1 per Variable in this table (StatCan's own convention here,
+  # confirmed against the real data) -- one small shared lookup (11 rows),
+  # recomputed only when raw_data() itself changes, instead of each of the
+  # 4 tabs below independently re-filtering the full raw_data() on every
+  # Variable pick just to read off one constant.
+  variable_uom_lookup <- reactive(distinct(req(raw_data()), Variable, UOM))
+
+  trend_tab_server("trend", raw_data, variable_uom_lookup)
+  ranking_tab_server("ranking", raw_data, variable_uom_lookup)
+  tab_module_server("bar", raw_data, "bar", variable_uom_lookup)
+  tab_module_server("table", raw_data, "table", variable_uom_lookup)
 }
 
 shinyApp(ui, server)
