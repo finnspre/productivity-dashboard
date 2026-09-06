@@ -5,6 +5,28 @@ library(plotly)
 library(DT)
 library(htmltools)
 
+# STATCAN_TABLE_ID / LP_DATA_CONTRACT / validate_data_contract() -- shared
+# with data_pipeline.R so both agree on exactly one definition of "what does
+# this table's data look like" (see that file's own header comment). Plain
+# relative path, not an absolute one -- Shiny always runs app.R with the
+# app's own folder as the working directory (true both for a real deploy and
+# for scripts/verify_app.R's sys.source(), run from this same project root),
+# the same assumption versioned_asset()'s "www/..." paths below already make.
+# local = TRUE -- not source()'s own default (FALSE, meaning "evaluate in
+# .GlobalEnv regardless of where source() itself was called from") --
+# so these definitions land in app.R's own environment (whatever that is:
+# .GlobalEnv for a real Shiny deploy, but a throwaway per-test environment
+# under scripts/verify_app.R's sys.source(), which runs several independent
+# copies of app.R in the same R session). Confirmed empirically: without
+# this, STATCAN_TABLE_ID et al. silently end up in .GlobalEnv instead of
+# alongside the rest of app.R's own top-level bindings -- functions defined
+# below still resolve them correctly by walking up the environment chain at
+# call time, but only by accident (because .GlobalEnv happens to be a parent
+# of the environment those functions close over) rather than because this
+# file actually owns them, and every re-run leaks another stale copy into
+# .GlobalEnv instead of being cleanly scoped to this file.
+source("data_contract.R", local = TRUE)
+
 LP_DATA_FILE <- Sys.getenv("LP_DATA_FILE", "lp_data.RData")
 
 # Appends a ?v=<mtime> cache-buster to a www/ asset path, so editing e.g.
@@ -407,13 +429,15 @@ load_lp_data <- function(path = LP_DATA_FILE) {
   e <- new.env()
   load(path, envir = e)
   df <- e$lp_data
-  # A handful of 3-digit industries come back from Statistics Canada named
-  # "X ==> Y" (e.g. "Ambulatory health care services ==> Non-profit
-  # institutions") -- Y there is just the true parent under this table's
-  # non-commercial-activity reclassification, which INDUSTRY_PARENT already
-  # encodes. Strip the "==> ..." suffix so the picker shows the plain
-  # industry name and INDUSTRY_PARENT nests it under its real parent instead
-  # of it dangling, unindented, as its own oddly-named entry.
+  # data_pipeline.R's own mutate() chain already strips this same "X ==> Y"
+  # suffix before ever writing lp_data.RData (see its comment there for what
+  # the suffix means), which makes this a no-op against today's pipeline
+  # output -- kept anyway as cheap insurance against the two layers drifting
+  # (e.g. a future pipeline change that reintroduces the raw StatCan naming
+  # without recalling this), since sub() on a string that's already clean
+  # costs nothing. If load_lp_data() is ever ported to a future table/
+  # dashboard (see data_contract.R) that never had this quirk to begin with,
+  # this whole block is safe to delete rather than something to port too.
   #
   # Regex over the handful of *distinct* Industry values, then remap by
   # match() -- not sub() over all ~588k rows directly. Same result (verified
@@ -424,6 +448,23 @@ load_lp_data <- function(path = LP_DATA_FILE) {
   industry_uniq <- unique(df$Industry)
   industry_uniq_clean <- sub("\\s*==>.*$", "", industry_uniq)
   df$Industry <- industry_uniq_clean[match(df$Industry, industry_uniq)]
+
+  # Fail loudly here -- not just in data_pipeline.R -- because lp_data.RData
+  # is its own process boundary: this file can be hand-edited, land from a
+  # differently-shaped pipeline run, or simply be corrupt, independently of
+  # whatever data_pipeline.R itself validated before saving it. safe_load_lp_data()
+  # (the only realistic caller of load_lp_data() -- see its own comment)
+  # already turns any thrown error here into a NULL sentinel that ui()/every
+  # tab's scoped_raw() already know how to show a clean message for, so a
+  # contract violation degrades exactly like a missing/corrupt file rather
+  # than needing a UI state of its own. This is also what stops a 0-row
+  # (e.g. an empty StatCan pull that made it all the way through) or
+  # empty-but-technically-loaded lp_data.RData from silently reaching ui()
+  # and building sliderInput(min=Inf, max=-Inf, ...)-style broken widgets --
+  # confirmed empirically to warn rather than error, so ui() previously
+  # would have finished "successfully" with a garbled page instead of the
+  # clean "Application unavailable" state this now produces.
+  validate_data_contract(df, LP_DATA_CONTRACT, paste0(path, " (loaded contract)"))
 
   # INDUSTRY_PARENT is a hand-maintained lookup, not derived from this data
   # pull -- industry_choices_tree() already fails *soft* for anything
@@ -457,9 +498,18 @@ load_lp_data <- function(path = LP_DATA_FILE) {
 LP_DATA_CACHE <- new.env(parent = emptyenv())
 cached_load_lp_data <- function(path = LP_DATA_FILE) {
   mtime <- file.mtime(path)
-  if (is.null(LP_DATA_CACHE$df) || !identical(LP_DATA_CACHE$mtime, mtime)) {
+  # Keyed on (path, mtime), not mtime alone -- LP_DATA_FILE never actually
+  # changes within one running app process (it's set once, at source time,
+  # from an env var), so this only matters for a caller that passes a
+  # different `path` than the default within the same R session (as
+  # scripts/verify_app.R's tests deliberately do, swapping in different
+  # fixture paths against the same sourced app.R environment) -- without the
+  # path check, two different files that happened to share an mtime would
+  # silently serve each other's cached data instead of ever being told apart.
+  if (is.null(LP_DATA_CACHE$df) || !identical(LP_DATA_CACHE$path, path) || !identical(LP_DATA_CACHE$mtime, mtime)) {
     LP_DATA_CACHE$df <- load_lp_data(path)
     LP_DATA_CACHE$mtime <- mtime
+    LP_DATA_CACHE$path <- path
   }
   LP_DATA_CACHE$df
 }
@@ -874,7 +924,7 @@ trend_tab_ui <- function(id, init_df, variable_choices, geography_choices, indus
         # otherwise fall back to Bootstrap's default 1rem <p> margin.
         p(
           class = "text-muted small", style = "margin-bottom: 0;",
-          "Source: Statistics Canada Table 36-10-0480-01"
+          paste0("Source: Statistics Canada Table ", STATCAN_TABLE_ID)
         ),
         uiOutput(ns("data_asof"))
       )
@@ -1224,7 +1274,7 @@ ranking_tab_ui <- function(id, init_df, variable_choices, geography_choices) {
         # otherwise fall back to Bootstrap's default 1rem <p> margin.
         p(
           class = "text-muted small", style = "margin-bottom: 0;",
-          "Source: Statistics Canada Table 36-10-0480-01"
+          paste0("Source: Statistics Canada Table ", STATCAN_TABLE_ID)
         ),
         uiOutput(ns("data_asof"))
       )
@@ -1704,7 +1754,7 @@ tab_module_ui <- function(id, init_df, kind, variable_choices, industry_tree) {
         # otherwise fall back to Bootstrap's default 1rem <p> margin.
         p(
           class = "text-muted small", style = "margin-bottom: 0;",
-          "Source: Statistics Canada Table 36-10-0480-01"
+          paste0("Source: Statistics Canada Table ", STATCAN_TABLE_ID)
         ),
         uiOutput(ns("data_asof"))
       )
