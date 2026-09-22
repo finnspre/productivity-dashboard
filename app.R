@@ -123,19 +123,23 @@ VARIABLE_ORDER <- c(
   "Unit labour cost", "Unit labour cost in US dollars", "Labour share"
 )
 
-# The Industry detail toggle on the Rankings tab -- selects a *maximum*
-# level of detail, not an exact one, so "3-digit" still includes the
-# Aggregate and 2-digit rows too (see industry_levels_upto() below).
+# The Industry detail toggle on the Rankings tab. For "Aggregate"/"2-digit"
+# this is a *maximum* level, not an exact one -- "2-digit" still includes
+# the Aggregate rows too (see industry_levels_upto() below). "3-digit" is
+# the exception: it's scoped to one chosen sector's own sub-sectors at a
+# time instead (see the "Sector" picker in ranking_tab_ui() and
+# ranking_tab_server()'s scoped_raw()), so it does NOT also pull in
+# Aggregate/2-digit rows the way industry_levels_upto() would.
 DEFAULT_INDUSTRY_LEVEL <- "Aggregate"
 INDUSTRY_LEVEL_ORDER <- c("Aggregate", "2-digit", "3-digit")
 
 # Rankings tab: row count above which the chart switches from a single
 # fixed-height, one-side-labelled layout to a taller, scrollable one with
 # labels split across both sides (see ranking_tab_server()'s output$chart
-# and output$chart_container). In practice only "Sub-sector level" (up to
-# ~139 rows -- 3 Aggregate + 25 2-digit + 111 3-digit industries in the
-# real data) crosses this; Aggregate (3 rows) and Sector level (~28 rows)
-# stay comfortably under it and keep today's exact appearance.
+# and output$chart_container). Aggregate (3 rows), Sector level (~28 rows),
+# and Sub-sector level scoped to one sector (at most 19 rows, Manufacturing)
+# all stay comfortably under this in the real data -- kept as a safety net
+# rather than removed in case a future data update adds a larger sector.
 RANKING_CHART_ROW_THRESHOLD <- 40
 RANKING_CHART_PX_PER_ROW <- 28
 RANKING_CHART_TICKFONT_SPLIT <- 10
@@ -568,6 +572,14 @@ ordered_unique <- function(values, preferred_order) {
 # the rest following the data's own grouping).
 series_choices <- function(df, dim_col, preferred_order = character(0)) {
   ordered_unique(df[[dim_col]], preferred_order)
+}
+
+# Rankings tab's Sub-sector level "Sector" picker: every 2-digit industry
+# present in the data, sorted alphabetically. Scopes the Sub-sector level
+# ranking chart to one sector's own sub-sectors at a time instead of every
+# sub-sector economy-wide (see ranking_tab_server()'s scoped_raw()).
+industry_sector_choices <- function(df) {
+  sort(unique(df$Industry[df$IndustryLevel == "2-digit"]))
 }
 
 # Assign palette colours to series in the order given.
@@ -1198,15 +1210,17 @@ trend_tab_server <- function(id, raw_data, variable_uom_lookup) {
   })
 }
 
-# The Rankings tab: pick one Variable + one Geography (+ a maximum Industry
-# detail level), see every matching industry's compound annual growth rate
-# (CAGR) over the full time span of the data, as a scatter plot. Unlike
-# Trends/Compare there's no picker for a *specific* industry -- all
-# industries up to the chosen detail level are shown at once -- so this gets
-# its own dedicated module rather than another tab_module_ui/
+# The Rankings tab: pick one Variable + one Geography (+ an Industry detail
+# level -- a maximum level for Aggregate/2-digit, or one chosen sector's own
+# sub-sectors for 3-digit), see every matching industry's compound annual
+# growth rate (CAGR) over the full time span of the data, as a scatter plot.
+# Unlike Trends/Compare there's no picker for a *specific* industry -- all
+# industries matching the chosen detail level are shown at once -- so this
+# gets its own dedicated module rather than another tab_module_ui/
 # tab_module_server "kind", same reasoning as the Trends tab.
 ranking_tab_ui <- function(id, init_df, variable_choices, geography_choices) {
   ns <- NS(id)
+  sector_choices <- industry_sector_choices(init_df)
 
   card(
     # card-sidebar -- see the matching comment on the Trends tab's card().
@@ -1250,6 +1264,20 @@ ranking_tab_ui <- function(id, init_df, variable_choices, geography_choices) {
           # Stacked rather than inline -- the longer labels above would
           # wrap awkwardly across a narrow sidebar as a horizontal row.
           selected = DEFAULT_INDUSTRY_LEVEL, inline = FALSE
+        ),
+        # Sub-sector level alone (~111 industries economy-wide) is too
+        # cluttered to rank on one chart, so it's scoped down to one 2-digit
+        # sector's own sub-sectors at a time -- see scoped_raw() below.
+        # Defaults to the first sector alphabetically so the chart is never
+        # blank, and stays populated (just hidden) at the other 2 levels so
+        # its selection survives toggling industry_level back and forth.
+        conditionalPanel(
+          "input.industry_level == '3-digit'", ns = ns,
+          selectInput(
+            ns("sector"), "Sector",
+            choices = sector_choices, selected = sector_choices[1],
+            selectize = FALSE
+          )
         ),
         # Reuses the Trends tab's .trend-more-options styling (chevron
         # summary, no default browser triangle) -- the class name is
@@ -1308,6 +1336,14 @@ ranking_tab_server <- function(id, raw_data, variable_uom_lookup) {
       }
       updateTreeSelectInput(session, "geography", tree_data = flat_tree_nodes(geo_choices), selected = new_geo)
 
+      sec_choices <- industry_sector_choices(df)
+      new_sector <- if (is.null(input$sector) || !(input$sector %in% sec_choices)) {
+        sec_choices[1]
+      } else {
+        input$sector
+      }
+      updateSelectInput(session, "sector", choices = sec_choices, selected = new_sector)
+
       year_min <- min(df$Year)
       year_max <- max(df$Year)
       current_range <- input$year_range
@@ -1323,11 +1359,19 @@ ranking_tab_server <- function(id, raw_data, variable_uom_lookup) {
       # See the matching comment on the Trends tab's own scoped_raw().
       validate(need(!is.null(raw_data()), "Data is temporarily unavailable -- please try again in a moment."))
       req(input$variable, input$geography, input$industry_level)
-      raw_data() %>%
-        filter(
-          Variable == input$variable, Geography == input$geography,
-          IndustryLevel %in% industry_levels_upto(input$industry_level)
-        )
+      df <- raw_data() %>% filter(Variable == input$variable, Geography == input$geography)
+
+      if (input$industry_level == "3-digit") {
+        # Scoped to just the chosen sector's own sub-sectors (see the
+        # "Sector" picker in ranking_tab_ui()) rather than every sub-sector
+        # economy-wide via industry_levels_upto() -- that's the clutter this
+        # picker exists to avoid.
+        req(input$sector)
+        subsectors <- names(INDUSTRY_PARENT)[INDUSTRY_PARENT == input$sector]
+        df %>% filter(IndustryLevel == "3-digit", Industry %in% subsectors)
+      } else {
+        df %>% filter(IndustryLevel %in% industry_levels_upto(input$industry_level))
+      }
     })
 
     # UOM is 1:1 per Variable (see variable_uom_lookup() in server(), shared
@@ -1490,6 +1534,10 @@ ranking_tab_server <- function(id, raw_data, variable_uom_lookup) {
       p <- p %>% layout(
         title = paste0(
           input$variable, " by industry — ", input$geography,
+          # Sub-sector level ranks only one sector's own sub-sectors at a
+          # time now (see scoped_raw()) -- named here so the title doesn't
+          # read as "by industry" over what's actually a single-sector view.
+          if (identical(input$industry_level, "3-digit")) paste0(" — ", input$sector) else "",
           " (", input$year_range[1], "-", input$year_range[2], ")"
         ),
         xaxis = list(title = "Compound annual growth rate (%)", gridcolor = GRIDLINE, color = INK_MUTED),
@@ -1545,11 +1593,18 @@ ranking_tab_server <- function(id, raw_data, variable_uom_lookup) {
 
     output$download_csv <- downloadHandler(
       filename = function() {
+        # Sector suffix only when it's actually scoping the data (Sub-sector
+        # level) -- see scoped_raw().
+        sector_part <- if (identical(input$industry_level, "3-digit")) {
+          paste0("_", gsub("[^A-Za-z0-9]+", "-", input$sector))
+        } else {
+          ""
+        }
         sprintf(
-          "productivity_ranking_%s_%s_%s_%s-%s_%s.csv",
+          "productivity_ranking_%s_%s_%s%s_%s-%s_%s.csv",
           gsub("[^A-Za-z0-9]+", "-", input$variable),
           gsub("[^A-Za-z0-9]+", "-", input$geography),
-          input$industry_level,
+          input$industry_level, sector_part,
           input$year_range[1], input$year_range[2], format(Sys.Date(), "%Y%m%d")
         )
       },
