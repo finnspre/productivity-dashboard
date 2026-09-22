@@ -1271,12 +1271,16 @@ ranking_tab_ui <- function(id, init_df, variable_choices, geography_choices) {
         # Defaults to the first sector alphabetically so the chart is never
         # blank, and stays populated (just hidden) at the other 2 levels so
         # its selection survives toggling industry_level back and forth.
+        # Same treeSelectInput widget as Variable/Geography above (and
+        # Industry on the Trends/Compare/Data tabs) -- a searchable list
+        # rather than a plain dropdown, for consistency across every picker
+        # in this app.
         conditionalPanel(
           "input.industry_level == '3-digit'", ns = ns,
-          selectInput(
+          treeSelectInput(
             ns("sector"), "Sector",
-            choices = sector_choices, selected = sector_choices[1],
-            selectize = FALSE
+            tree_data = flat_tree_nodes(sector_choices), selected = sector_choices[1],
+            placeholder = "Search sectors..."
           )
         ),
         # Reuses the Trends tab's .trend-more-options styling (chevron
@@ -1342,7 +1346,7 @@ ranking_tab_server <- function(id, raw_data, variable_uom_lookup) {
       } else {
         input$sector
       }
-      updateSelectInput(session, "sector", choices = sec_choices, selected = new_sector)
+      updateTreeSelectInput(session, "sector", tree_data = flat_tree_nodes(sec_choices), selected = new_sector)
 
       year_min <- min(df$Year)
       year_max <- max(df$Year)
